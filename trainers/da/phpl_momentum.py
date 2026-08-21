@@ -59,6 +59,27 @@ class CustomCLIP(Base_CustomCLIP):
         return logits, image_features
 
 
+class _FrozenTeacherCLIP(CustomCLIP):
+    """teacher_now/teacher_init never receive gradients (LoRA is written
+    directly via EMA/copy, never via optimizer step) and must always run
+    deterministically, always recomputing LoRA live from the current
+    lora_A/lora_B rather than a stale merged snapshot (see LinearLoRA.train()/
+    lora_train() in loralib/layers.py: calling .train(mode) on a LinearLoRA
+    either bakes the current LoRA delta into the frozen weight once and locks
+    out future updates, or re-enables dropout -- both wrong for a teacher).
+
+    Overriding train() here to unconditionally force every submodule's
+    `.training = False`, regardless of who calls .train()/.eval() or what
+    mode is requested, makes this hold no matter what -- independent of
+    tracking every call site in Dassl (set_model_mode fires at the start of
+    every epoch and after every test()) or any call site added later."""
+
+    def train(self, mode=True):
+        for m in self.modules():
+            m.training = False
+        return self
+
+
 def _lora_param_items(model):
     return [(k, v) for k, v in model.state_dict().items() if "lora_" in k]
 
@@ -77,18 +98,6 @@ def _ema_update_lora_params(ema_model, src_model, momentum):
     ema_state = ema_model.state_dict()
     for k, v in _lora_param_items(src_model):
         ema_state[k].mul_(momentum).add_(v, alpha=1.0 - momentum)
-
-
-def _eval_no_merge(model):
-    """Like model.eval(), but WITHOUT going through LinearLoRA.train()'s side
-    effect of permanently baking the current LoRA delta into the frozen weight
-    (self.merged=True) and locking out future updates. Setting `.training`
-    directly (bypassing the overridden train()) disables dropout while keeping
-    `self.merged` at its default False forever, so forward() always recomputes
-    from the live (EMA-updated) lora_A/lora_B on every call."""
-    for m in model.modules():
-        m.training = False
-    return model
 
 
 @TRAINER_REGISTRY.register()
@@ -113,8 +122,8 @@ class PHPLMOMENTUM(BaseDA):
 
         print("Building student / teacher_now / teacher_init CLIP wrappers")
         self.student = CustomCLIP(cfg, classnames, clip_model_student)
-        self.teacher_now = CustomCLIP(cfg, classnames, clip_model_teacher_now)
-        self.teacher_init = CustomCLIP(cfg, classnames, clip_model_teacher_init)
+        self.teacher_now = _FrozenTeacherCLIP(cfg, classnames, clip_model_teacher_now)
+        self.teacher_init = _FrozenTeacherCLIP(cfg, classnames, clip_model_teacher_init)
 
         is_vit = cfg.MODEL.BACKBONE.NAME.split('-')[0] == 'ViT'
         apply_fn = apply_lora if is_vit else apply_lora_rn
@@ -145,12 +154,12 @@ class PHPLMOMENTUM(BaseDA):
         self.teacher_now.to(self.device)
         self.teacher_init.to(self.device)
 
-        # Teachers never receive gradients and must always recompute LoRA live
-        # from the current lora_A/lora_B (teacher_now changes every batch via
-        # EMA) -- see _eval_no_merge's docstring for why plain .eval() is wrong
-        # here.
-        _eval_no_merge(self.teacher_now)
-        _eval_no_merge(self.teacher_init)
+        # _FrozenTeacherCLIP.train() forces `.training = False` on every
+        # submodule no matter what -- call it once here (any subsequent call
+        # from Dassl's set_model_mode, e.g. at the start of every epoch, is a
+        # harmless no-op).
+        self.teacher_now.eval()
+        self.teacher_init.eval()
 
         len_train_loader_x = len(self.train_loader_x)
         len_train_loader_u = len(self.train_loader_u)
@@ -211,10 +220,9 @@ class PHPLMOMENTUM(BaseDA):
         image_x, label_x, image_u_strong, image_u_weak, label_u = self.parse_batch_train(batch_x, batch_u)
 
         self.student.train()
-        # teacher_now/teacher_init were permanently set to no-merge eval mode
-        # once in build_model() (see _eval_no_merge) -- do NOT call .eval()
-        # here, it would merge the current LoRA delta into the frozen weight
-        # and freeze teacher_now forever.
+        # teacher_now/teacher_init are _FrozenTeacherCLIP -- their train()
+        # unconditionally forces eval-like, no-merge behavior, so no explicit
+        # call is needed (or harmful) here.
 
         logits_x, feat_x = self.student(image_x)
         loss_x = F.cross_entropy(logits_x, label_x)
@@ -266,7 +274,8 @@ class PHPLMOMENTUM(BaseDA):
     @torch.no_grad()
     def test(self, split=None):
         """Evaluation uses teacher_now (the adapting EMA teacher), not the student."""
-        # No .eval() call here -- see build_model()'s _eval_no_merge call.
+        # No .eval() call needed -- _FrozenTeacherCLIP.train() (see build_model)
+        # already forces this permanently.
         self.evaluator.reset()
 
         if split is None:
