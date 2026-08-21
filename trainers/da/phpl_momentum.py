@@ -35,6 +35,10 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
   - Student sees strong-augmented target/source images; the teacher sees a weak-augmented
     target view (asymmetric-view self-training, reduces confirmation bias).
   - loss_mmd (Multi-Kernel MMD between source/target student features) is kept, same as PHPL.
+  - Optional CutMix (cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX, default off): cuts a random box
+    out of image_u_strong and pastes it into image_x (both already strong-aug), and adds
+    an extra loss_mix = lam*CE(pred_mix, label_x) + (1-lam)*CE(pred_mix, pseudo_label) to
+    the total loss, where lam is the fraction of the mixed image that stayed source.
   - Evaluation uses teacher_now (the adapting EMA teacher), not the student. save_model/
     load_model persist teacher_now's own LoRA snapshot directly (a separate "TeacherNow"
     checkpoint dir, alongside "Student") -- reconstructing it by re-copying student's
@@ -42,6 +46,7 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
     teacher_now's EMA state actually was when that epoch's eval score was recorded.
 """
 import os.path as osp
+import random
 
 import torch
 import torch.nn as nn
@@ -98,6 +103,40 @@ class _FrozenTeacherCLIP(CustomCLIP):
         return self
 
 
+def _rand_bbox(height, width, lam):
+    """One random box whose area is (1 - lam) fraction of the image, same
+    formula as the original CutMix paper's rand_bbox."""
+    cut_rat = (1.0 - lam) ** 0.5
+    cut_h = int(height * cut_rat)
+    cut_w = int(width * cut_rat)
+
+    cy = random.randint(0, height - 1)
+    cx = random.randint(0, width - 1)
+
+    y1 = max(cy - cut_h // 2, 0)
+    y2 = min(cy + cut_h // 2, height)
+    x1 = max(cx - cut_w // 2, 0)
+    x2 = min(cx + cut_w // 2, width)
+    return y1, y2, x1, x2
+
+
+def _cutmix(image_a, image_b, alpha=1.0):
+    """Cut a random box out of image_b and paste it into image_a (both
+    [B, C, H, W], same shape). Returns (mixed_image, lam), where lam is the
+    actual fraction of pixels that stayed from image_a (not the raw Beta
+    sample, since the box is snapped to integer pixels)."""
+    lam = float(torch.distributions.Beta(alpha, alpha).sample())
+    height, width = image_a.shape[-2:]
+    y1, y2, x1, x2 = _rand_bbox(height, width, lam)
+
+    mixed = image_a.clone()
+    mixed[:, :, y1:y2, x1:x2] = image_b[:, :, y1:y2, x1:x2]
+
+    box_area = (y2 - y1) * (x2 - x1)
+    lam = 1.0 - box_area / (height * width)
+    return mixed, lam
+
+
 def _lora_param_items(model):
     return [(k, v) for k, v in model.state_dict().items() if "lora_" in k]
 
@@ -131,6 +170,8 @@ class PHPLMOMENTUM(BaseDA):
         self.loss_u_mode = cfg.TRAINER.PHPLMOMENTUM.LOSS_U_MODE
         if self.loss_u_mode not in ("mask", "ratio"):
             raise ValueError(f"Unknown TRAINER.PHPLMOMENTUM.LOSS_U_MODE: {self.loss_u_mode!r} (expected 'mask' or 'ratio')")
+        self.use_cutmix = cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX
+        self.cutmix_alpha = cfg.TRAINER.PHPLMOMENTUM.CUTMIX_ALPHA
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x3 (student, teacher_now, teacher_init)")
         clip_model_student = load_clip_to_cpu(cfg)
@@ -286,7 +327,21 @@ class PHPLMOMENTUM(BaseDA):
 
         loss_mmd = MK_MMD(feat_x, feat_u)
 
-        loss = loss_x + loss_u + loss_mmd
+        if self.use_cutmix:
+            # Cut a box out of image_u_strong and paste it into image_x (both
+            # already strong-aug); truncate to the smaller batch in case the
+            # two loaders' batch sizes ever differ (e.g. a partial last batch).
+            n = min(image_x.size(0), image_u_strong.size(0))
+            mixed_image, lam = _cutmix(image_x[:n], image_u_strong[:n], alpha=self.cutmix_alpha)
+            logits_mix, _ = self.student(mixed_image)
+            loss_mix = (
+                lam * F.cross_entropy(logits_mix, label_x[:n])
+                + (1 - lam) * F.cross_entropy(logits_mix, pseudo_label[:n])
+            )
+        else:
+            loss_mix = torch.tensor(0.0, device=self.device)
+
+        loss = loss_x + loss_u + loss_mmd + loss_mix
         self.model_backward_and_update_with_gradient_monitoring(
             loss,
             names="Student",
@@ -302,6 +357,7 @@ class PHPLMOMENTUM(BaseDA):
             "loss_x": loss_x.item(),
             "loss_u": loss_u.item(),
             "loss_mmd": loss_mmd.item(),
+            "loss_mix": loss_mix.item(),
             "beta": beta,
             "mask_ratio": mask_ratio.item(),
             "acc_source": compute_accuracy(logits_x, label_x)[0].item(),

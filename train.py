@@ -199,6 +199,11 @@ def extend_cfg(cfg, args):
         #       that clears CONFI. Opt-in only, via TRAINER.PHPLMOMENTUM.LOSS_U_MODE ratio.
         cfg.TRAINER.PHPLMOMENTUM.LOSS_U_MODE = "mask"
 
+        # CutMix between source (image_x) and target (image_u_strong), both strong-aug:
+        # adds an extra loss_mix term (opt-in, default off, doesn't change existing behavior).
+        cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX = False
+        cfg.TRAINER.PHPLMOMENTUM.CUTMIX_ALPHA = 1.0  # Beta(alpha, alpha) for the mixed-area fraction
+
 
 
 def setup_cfg(args):
