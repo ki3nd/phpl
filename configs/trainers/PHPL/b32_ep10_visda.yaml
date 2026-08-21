@@ -33,7 +33,3 @@ TEST:
 MODEL:
   BACKBONE:
     NAME: "ViT-B/16"
-
-TRAINER:
-  MAPLE:
-    CTX_INIT: "a photo of a"
