@@ -199,6 +199,13 @@ def extend_cfg(cfg, args):
         #       that clears CONFI. Opt-in only, via TRAINER.PHPLMOMENTUM.LOSS_U_MODE ratio.
         cfg.TRAINER.PHPLMOMENTUM.LOSS_U_MODE = "mask"
 
+        # beta = (epoch / (max_epoch - 1)) ** BETA_POWER, then
+        # logits_fusion = beta*teacher_now + (1-beta)*teacher_init.
+        # BETA_POWER=1.0 (default) is linear, unchanged from before.
+        # BETA_POWER<1.0 (e.g. 0.5) makes beta rise faster early on, so
+        # teacher_init's (frozen anchor's) influence drops off sooner.
+        cfg.TRAINER.PHPLMOMENTUM.BETA_POWER = 1.0
+
         # CutMix between source (image_x) and target (image_u_strong), both strong-aug:
         # adds an extra loss_mix term (opt-in, default off, doesn't change existing behavior).
         cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX = False

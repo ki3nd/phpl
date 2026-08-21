@@ -172,6 +172,7 @@ class PHPLMOMENTUM(BaseDA):
             raise ValueError(f"Unknown TRAINER.PHPLMOMENTUM.LOSS_U_MODE: {self.loss_u_mode!r} (expected 'mask' or 'ratio')")
         self.use_cutmix = cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX
         self.cutmix_alpha = cfg.TRAINER.PHPLMOMENTUM.CUTMIX_ALPHA
+        self.beta_power = cfg.TRAINER.PHPLMOMENTUM.BETA_POWER
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x3 (student, teacher_now, teacher_init)")
         clip_model_student = load_clip_to_cpu(cfg)
@@ -302,7 +303,10 @@ class PHPLMOMENTUM(BaseDA):
             logits_teacher_init, _ = self.teacher_init(image_u_weak)
 
             denom = max(self.max_epoch - 1, 1)
-            beta = self.epoch / denom
+            # BETA_POWER=1.0 (default) is the original linear ramp; <1.0 (e.g. 0.5,
+            # sqrt) makes beta rise faster early on, so teacher_init's influence
+            # drops off sooner than the linear schedule.
+            beta = (self.epoch / denom) ** self.beta_power
             # Fuse in logit space, softmax once -- same as PHPL's CustomCLIP.forward
             # (softmax(a*x+b*y) is a weighted GEOMETRIC mean of softmax(x)/softmax(y),
             # not an arithmetic mean of two already-softmaxed distributions; CONFI was
