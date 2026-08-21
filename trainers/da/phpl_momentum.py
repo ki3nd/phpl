@@ -24,9 +24,12 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
         pseudo_label = argmax(softmax(logits_fusion))
     beta ramps 0 -> 1 across training, so pseudo-labels lean on the stable anchor early
     and on the adapting teacher_now later.
-  - loss_u is masked exactly like PHPL's CONFI: only target samples where the fused
-    teacher probability's max class exceeds cfg.TRAINER.PHPLMOMENTUM.CONFI (default 0.85)
-    contribute to the cross-entropy, averaged over the kept samples (not the full batch).
+  - loss_u uses a DACS-style ratio weighting instead of PHPL's hard CONFI mask: no
+    target sample is dropped from the cross-entropy, but the WHOLE batch's loss_u is
+    scaled by `ratio` = the fraction of the batch whose fused teacher probability's
+    max class exceeds cfg.TRAINER.PHPLMOMENTUM.CONFI (default 0.85). This still lets
+    the confidence level gate how much loss_u matters, but never zeroes it out
+    entirely just because no single sample individually clears CONFI.
   - Student sees strong-augmented target/source images; the teacher sees a weak-augmented
     target view (asymmetric-view self-training, reduces confirmation bias).
   - loss_mmd (Multi-Kernel MMD between source/target student features) is kept, same as PHPL.
@@ -255,10 +258,14 @@ class PHPLMOMENTUM(BaseDA):
             prob_fusion = F.softmax(logits_fusion, dim=-1)
             max_probs, pseudo_label = torch.max(prob_fusion, dim=-1)
             mask = max_probs.ge(self.confi).float()
+            # DACS-style: never drop samples from the loss -- scale the WHOLE
+            # batch's loss_u by the fraction that clears CONFI, instead of
+            # averaging only over that fraction (which hard-masking does, and
+            # which can hit "0 samples pass -> loss_u == 0" early in training).
+            ratio = mask.mean()
 
         logits_u, feat_u = self.student(image_u_strong)
-        epsilon = 1e-8
-        loss_u = (F.cross_entropy(logits_u, pseudo_label, reduction="none") * mask).sum() / (mask.sum() + epsilon)
+        loss_u = F.cross_entropy(logits_u, pseudo_label) * ratio
 
         loss_mmd = MK_MMD(feat_x, feat_u)
 
@@ -279,7 +286,7 @@ class PHPLMOMENTUM(BaseDA):
             "loss_u": loss_u.item(),
             "loss_mmd": loss_mmd.item(),
             "beta": beta,
-            "mask_ratio": mask.mean().item(),
+            "mask_ratio": ratio.item(),
             "acc_source": compute_accuracy(logits_x, label_x)[0].item(),
             "acc_target_pseudo": compute_accuracy(logits_u, pseudo_label)[0].item(),
             "acc_target_true": compute_accuracy(logits_u, label_u)[0].item(),
