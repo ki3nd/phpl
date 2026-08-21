@@ -87,7 +87,7 @@ class CustomCLIP(Base_CustomCLIP):
         if train:
             if source:
                 loss = F.cross_entropy(logits, label)
-                return loss, logits, image_features
+                return loss, logits, image_features, None
             else:
                 logits_u, _ = self.clip_model_teacher(image.type(self.dtype), self.tokenized_prompts.to(self.logit_scale.device))
                 beta = epoch / self.epoch
@@ -99,7 +99,7 @@ class CustomCLIP(Base_CustomCLIP):
                 if self.cfg.MODEL.BACKBONE.NAME.split('-')[0] != 'ViT':
                     epsilon = 1e-8
                 loss = (F.cross_entropy(logits, label_p, reduction="none") * mask).sum() / (mask.sum() + epsilon)
-                return loss, logits, image_features
+                return loss, logits, image_features, mask.mean().item()
         else:
             return logits
 class CLIPGradCAMWrapper(nn.Module):
@@ -162,8 +162,8 @@ class PHPL(BaseDA):
         label = label.to(image_x.device)
         label_u = label_u.to(image_u.device)
 
-        loss_x, logits_x, source_features = self.model(image_x, label, epoch=self.epoch, source=True, train=True)
-        loss_u, logits_u, target_features = self.model(image_u, epoch=self.epoch, source=False, train=True)
+        loss_x, logits_x, source_features, _ = self.model(image_x, label, epoch=self.epoch, source=True, train=True)
+        loss_u, logits_u, target_features, mask_ratio = self.model(image_u, epoch=self.epoch, source=False, train=True)
 
         loss_mmd = MK_MMD(source_features, target_features)
 
@@ -179,6 +179,7 @@ class PHPL(BaseDA):
             "loss_x": loss_x.item(),
             "loss_u": loss_u.item(),
             "loss_mmd": loss_mmd.item(),
+            "mask_ratio": mask_ratio,
             "acc_source": compute_accuracy(logits_x, label)[0].item(),
             "acc_target": compute_accuracy(logits_u, label_u)[0].item(),
         }
