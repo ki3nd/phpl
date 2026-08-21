@@ -148,7 +148,18 @@ class PHPLMOMENTUM(BaseDA):
         else:
             raise ValueError('Training batch name is wrong!')
 
-        self.optim = build_optimizer(self.student, cfg.OPTIM)
+        # Student's LoRA parameters stay fp16 (matching PHPL) and are what forward/eval
+        # actually use. But lr * grad is frequently too small to survive fp16 rounding
+        # when accumulated directly into an fp16 leaf parameter (same underflow issue
+        # fixed for the EMA teacher above) -- so the optimizer instead updates an fp32
+        # "shadow" copy of each LoRA parameter, and the fp16 leaf is refreshed from that
+        # shadow after every step. torch.optim.SGD's own momentum/weight-decay logic runs
+        # unmodified on the fp32 shadow; only where the numbers are stored differs.
+        self.student_lora_params = [p for n, p in self.student.named_parameters() if "lora" in n]
+        self.student_lora_shadow = [
+            nn.Parameter(p.detach().clone().float()) for p in self.student_lora_params
+        ]
+        self.optim = build_optimizer(self.student_lora_shadow, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("Student", self.student, self.optim, self.sched)
         # Registered without an optimizer/scheduler: EMA-updated, never trained by gradient.
@@ -192,6 +203,35 @@ class PHPLMOMENTUM(BaseDA):
         label_u = batch_u["label"].to(self.device)
         return image_x, label_x, image_u_strong, image_u_weak, label_u
 
+    def _student_backward_and_update(self, loss, max_norm=20.0, monitor_interval=10, clip_on_explosion=True):
+        """backward + optimizer step for the student's (fp16) LoRA parameters, via the
+        fp32 shadow copies built in build_model (see the comment there for why)."""
+        for p in self.student_lora_params:
+            p.grad = None
+        self.detect_anomaly(loss)
+        loss.backward()
+
+        if self.student_lora_params:
+            if clip_on_explosion:
+                total_norm = torch.nn.utils.clip_grad_norm_(self.student_lora_params, max_norm=max_norm)
+            else:
+                grads = [p.grad.detach().norm() for p in self.student_lora_params if p.grad is not None]
+                total_norm = torch.norm(torch.stack(grads)) if grads else torch.tensor(0.0)
+        else:
+            total_norm = torch.tensor(0.0)
+
+        if monitor_interval and (self.batch_idx + 1) % monitor_interval == 0:
+            print(f"[grad-norm] epoch {self.epoch + 1} batch {self.batch_idx + 1}: {float(total_norm):.4f}")
+
+        self.optim.zero_grad()
+        for p, shadow in zip(self.student_lora_params, self.student_lora_shadow):
+            shadow.grad = p.grad.detach().float() if p.grad is not None else None
+        self.optim.step()
+
+        with torch.no_grad():
+            for p, shadow in zip(self.student_lora_params, self.student_lora_shadow):
+                p.data.copy_(shadow.data.to(p.dtype))
+
     def forward_backward(self, batch_x, batch_u):
         image_x, label_x, image_u_strong, image_u_weak, label_u = self.parse_batch_train(batch_x, batch_u)
 
@@ -220,9 +260,8 @@ class PHPLMOMENTUM(BaseDA):
         loss_mmd = MK_MMD(feat_x, feat_u)
 
         loss = loss_x + loss_u + loss_mmd
-        self.model_backward_and_update_with_gradient_monitoring(
+        self._student_backward_and_update(
             loss,
-            names="Student",
             max_norm=20.0,
             monitor_interval=10,
             clip_on_explosion=True,
