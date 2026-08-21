@@ -1,0 +1,7 @@
+ftfy
+regex
+tqdm
+dassl
+einops
+git+https://github.com/openai/CLIP.git
+pytorch-grad-cam
