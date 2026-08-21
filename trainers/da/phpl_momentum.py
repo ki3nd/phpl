@@ -2,17 +2,23 @@
 PHPLMOMENTUM: Mean-Teacher self-training on top of PHPL's LoRA-CLIP architecture.
 
 Differences vs. the original PHPL trainer (trainers/da/phpl.py):
-  - Only two CLIP-LoRA instances are built: student and teacher_now (both from the
-    SAME backbone, cfg.MODEL.BACKBONE.NAME). There is no separate "teacher_init"
-    backbone -- see _lora_bypassed()'s docstring for why teacher_now's forward pass
-    with its LoRA contribution suppressed is mathematically identical, at any point
-    in training, to what a permanently-frozen teacher_init snapshot would produce.
-    This saves a full extra CLIP backbone copy in memory.
+  - Three CLIP instances: student and teacher_now are LoRA-CLIP (apply_lora applied),
+    teacher_init is a PLAIN CLIP model that apply_lora is never called on -- exactly
+    like PHPL's own clip_model_teacher, so its attention layers stay PyTorch's native
+    nn.MultiheadAttention forever, never replaced by PlainMultiheadAttentionLoRA's
+    (loralib/layers.py) reimplemented attention path. This was previously optimized
+    away (teacher_now with its LoRA contribution suppressed via a "bypass" trick,
+    mathematically equal to teacher_init's pretrained weights) to save a backbone copy
+    of memory, but that still routed through PlainMultiheadAttentionLoRA's from-scratch
+    attention implementation -- an observed confidence gap vs PHPL's own teacher
+    (mask_ratio ~0.34 in PHPL at epoch 0 vs ~0.00 for the bypassed anchor) suggested a
+    numerical discrepancy there, so teacher_init is back as a real separate,
+    untouched-by-LoRA model for a fair, apples-to-apples comparison against PHPL.
   - teacher_now's LoRA weights are updated by EMA/momentum from student's LoRA after every
-    step (no gradient, no optimizer) -- classic Mean-Teacher.
-  - Pseudo-label for the student comes from a logit-space blend of "teacher_now with
-    LoRA" and "teacher_now with LoRA bypassed" (the t=0 anchor) -- same formula as
-    PHPL's CustomCLIP.forward:
+    step (no gradient, no optimizer) -- classic Mean-Teacher. teacher_init is a
+    permanent, never-touched snapshot of the original pretrained CLIP.
+  - Pseudo-label for the student comes from a logit-space blend of teacher_now and
+    teacher_init -- same formula as PHPL's CustomCLIP.forward:
         beta = epoch / (max_epoch - 1)
         logits_fusion = beta * teacher_now_logits + (1 - beta) * teacher_init_logits
         pseudo_label = argmax(softmax(logits_fusion))
@@ -26,7 +32,6 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
   - loss_mmd (Multi-Kernel MMD between source/target student features) is kept, same as PHPL.
   - Evaluation uses teacher_now (the adapting EMA teacher), not the student.
 """
-import contextlib
 import os.path as osp
 
 import torch
@@ -84,35 +89,6 @@ class _FrozenTeacherCLIP(CustomCLIP):
         return self
 
 
-@contextlib.contextmanager
-def _lora_bypassed(model):
-    """Temporarily force every wrapped LoRA sublayer of `model` to skip its
-    LoRA contribution and return the frozen residual-weight-only output.
-
-    init_lora_param() (loralib/layers.py) sets, once at construction:
-        residual = W - scaling * (lora_B @ lora_A)
-    which is an exact algebraic identity (residual + X = W for ANY X), not an
-    approximation -- so `residual` alone reconstructs the ORIGINAL pretrained
-    CLIP weight exactly. Since EMA/_ema_update_lora_params only ever touches
-    lora_A/lora_B (never the residual weight), teacher_now's residual is fixed
-    forever from construction. So "teacher_now with LoRA bypassed" is always
-    mathematically identical to a hypothetical permanently-frozen teacher_init
-    snapshot -- no separate model/backbone copy needed.
-
-    Implemented by toggling `.merged = True` on each LinearLoRA sublayer
-    WITHOUT calling add_lora_data() -- so nothing is written into the residual
-    weight, this is a pure read-time toggle, restored in `finally`."""
-    lora_layers = [m for m in model.modules() if hasattr(m, "merged") and hasattr(m, "r") and m.r > 0]
-    prev_merged = [m.merged for m in lora_layers]
-    for m in lora_layers:
-        m.merged = True
-    try:
-        yield model
-    finally:
-        for m, was_merged in zip(lora_layers, prev_merged):
-            m.merged = was_merged
-
-
 def _lora_param_items(model):
     return [(k, v) for k, v in model.state_dict().items() if "lora_" in k]
 
@@ -144,17 +120,24 @@ class PHPLMOMENTUM(BaseDA):
         self.ema_momentum = cfg.TRAINER.PHPLMOMENTUM.EMA_MOMENTUM
         self.confi = cfg.TRAINER.PHPLMOMENTUM.CONFI
 
-        print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x2 (student, teacher_now)")
+        print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x3 (student, teacher_now, teacher_init)")
         clip_model_student = load_clip_to_cpu(cfg)
         clip_model_teacher_now = load_clip_to_cpu(cfg)
+        clip_model_teacher_init = load_clip_to_cpu(cfg)
 
         if cfg.TRAINER.PHPLMOMENTUM.PREC in ("fp32", "amp"):
             clip_model_student.float()
             clip_model_teacher_now.float()
+            clip_model_teacher_init.float()
 
-        print("Building student / teacher_now CLIP wrappers")
+        print("Building student / teacher_now / teacher_init CLIP wrappers")
         self.student = CustomCLIP(cfg, classnames, clip_model_student)
         self.teacher_now = _FrozenTeacherCLIP(cfg, classnames, clip_model_teacher_now)
+        # teacher_init is a PLAIN CustomCLIP -- apply_lora is deliberately never called
+        # on it below, so its image_encoder/text_encoder keep PyTorch's native
+        # nn.MultiheadAttention (never replaced by PlainMultiheadAttentionLoRA),
+        # exactly matching how PHPL builds its own clip_model_teacher.
+        self.teacher_init = CustomCLIP(cfg, classnames, clip_model_teacher_init)
 
         is_vit = cfg.MODEL.BACKBONE.NAME.split('-')[0] == 'ViT'
         apply_fn = apply_lora if is_vit else apply_lora_rn
@@ -162,7 +145,7 @@ class PHPLMOMENTUM(BaseDA):
         apply_fn(cfg, self.teacher_now)
 
         print("Freezing everything except student's LoRA parameters...")
-        for model in (self.student, self.teacher_now):
+        for model in (self.student, self.teacher_now, self.teacher_init):
             for param in model.parameters():
                 param.requires_grad_(False)
         for name, param in self.student.named_parameters():
@@ -170,7 +153,7 @@ class PHPLMOMENTUM(BaseDA):
                 param.requires_grad_(True)
 
         # teacher_now starts as an exact copy of student's (freshly-initialized) LoRA weights.
-        # There is no separate teacher_init snapshot to copy into -- see _lora_bypassed().
+        # teacher_init has no LoRA params at all -- nothing to copy into it.
         _copy_lora_params(self.student, self.teacher_now)
 
         Total_Memory = 0
@@ -181,11 +164,14 @@ class PHPLMOMENTUM(BaseDA):
 
         self.student.to(self.device)
         self.teacher_now.to(self.device)
+        self.teacher_init.to(self.device)
 
         # _FrozenTeacherCLIP.train() forces `.training = False` on every
         # submodule no matter what -- call it once here (any subsequent call
         # from Dassl's set_model_mode, e.g. at the start of every epoch, is a
-        # harmless no-op).
+        # harmless no-op). teacher_init has no LoRA layers and CLIP's native
+        # nn.MultiheadAttention is built with dropout=0, so its .train()/.eval()
+        # state genuinely never affects its output -- no special handling needed.
         self.teacher_now.eval()
 
         len_train_loader_x = len(self.train_loader_x)
@@ -204,6 +190,8 @@ class PHPLMOMENTUM(BaseDA):
         self.register_model("Student", self.student, self.optim, self.sched)
         # Registered without an optimizer/scheduler: EMA-updated, never trained by gradient.
         self.register_model("TeacherNow", self.teacher_now, None, None)
+        # No gradient, no EMA -- a permanent, never-touched snapshot.
+        self.register_model("TeacherInit", self.teacher_init, None, None)
 
         self.t_sne_path = osp.join(self.output_dir, "tsne")
         mkdir_if_missing(self.t_sne_path)
@@ -255,8 +243,7 @@ class PHPLMOMENTUM(BaseDA):
 
         with torch.no_grad():
             logits_teacher_now, _ = self.teacher_now(image_u_weak)
-            with _lora_bypassed(self.teacher_now):
-                logits_teacher_init, _ = self.teacher_now(image_u_weak)
+            logits_teacher_init, _ = self.teacher_init(image_u_weak)
 
             denom = max(self.max_epoch - 1, 1)
             beta = self.epoch / denom
