@@ -79,6 +79,18 @@ def _ema_update_lora_params(ema_model, src_model, momentum):
         ema_state[k].mul_(momentum).add_(v, alpha=1.0 - momentum)
 
 
+def _eval_no_merge(model):
+    """Like model.eval(), but WITHOUT going through LinearLoRA.train()'s side
+    effect of permanently baking the current LoRA delta into the frozen weight
+    (self.merged=True) and locking out future updates. Setting `.training`
+    directly (bypassing the overridden train()) disables dropout while keeping
+    `self.merged` at its default False forever, so forward() always recomputes
+    from the live (EMA-updated) lora_A/lora_B on every call."""
+    for m in model.modules():
+        m.training = False
+    return model
+
+
 @TRAINER_REGISTRY.register()
 class PHPLMOMENTUM(BaseDA):
 
@@ -132,6 +144,13 @@ class PHPLMOMENTUM(BaseDA):
         self.student.to(self.device)
         self.teacher_now.to(self.device)
         self.teacher_init.to(self.device)
+
+        # Teachers never receive gradients and must always recompute LoRA live
+        # from the current lora_A/lora_B (teacher_now changes every batch via
+        # EMA) -- see _eval_no_merge's docstring for why plain .eval() is wrong
+        # here.
+        _eval_no_merge(self.teacher_now)
+        _eval_no_merge(self.teacher_init)
 
         len_train_loader_x = len(self.train_loader_x)
         len_train_loader_u = len(self.train_loader_u)
@@ -192,8 +211,10 @@ class PHPLMOMENTUM(BaseDA):
         image_x, label_x, image_u_strong, image_u_weak, label_u = self.parse_batch_train(batch_x, batch_u)
 
         self.student.train()
-        self.teacher_now.eval()
-        self.teacher_init.eval()
+        # teacher_now/teacher_init were permanently set to no-merge eval mode
+        # once in build_model() (see _eval_no_merge) -- do NOT call .eval()
+        # here, it would merge the current LoRA delta into the frozen weight
+        # and freeze teacher_now forever.
 
         logits_x, feat_x = self.student(image_x)
         loss_x = F.cross_entropy(logits_x, label_x)
@@ -245,7 +266,7 @@ class PHPLMOMENTUM(BaseDA):
     @torch.no_grad()
     def test(self, split=None):
         """Evaluation uses teacher_now (the adapting EMA teacher), not the student."""
-        self.teacher_now.eval()
+        # No .eval() call here -- see build_model()'s _eval_no_merge call.
         self.evaluator.reset()
 
         if split is None:
