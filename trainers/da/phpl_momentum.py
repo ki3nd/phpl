@@ -17,8 +17,9 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
         pseudo_label = argmax(prob_fusion)
     beta ramps 0 -> 1 across training, so pseudo-labels lean on the stable anchor early
     and on the adapting teacher_now later.
-  - No confidence threshold / FixMatch-style masking for now (dropped on purpose, per current
-    experiment plan) -- loss_u is a plain CE over the whole target batch.
+  - loss_u is masked exactly like PHPL's CONFI: only target samples where the fused
+    teacher probability's max class exceeds cfg.TRAINER.PHPLMOMENTUM.CONFI (default 0.85)
+    contribute to the cross-entropy, averaged over the kept samples (not the full batch).
   - Student sees strong-augmented target/source images; the teacher sees a weak-augmented
     target view (asymmetric-view self-training, reduces confirmation bias).
   - loss_mmd (Multi-Kernel MMD between source/target student features) is kept, same as PHPL.
@@ -140,6 +141,7 @@ class PHPLMOMENTUM(BaseDA):
         self.domains = cfg.DOMAINS
         self.save = cfg.SAVE_MODEL
         self.ema_momentum = cfg.TRAINER.PHPLMOMENTUM.EMA_MOMENTUM
+        self.confi = cfg.TRAINER.PHPLMOMENTUM.CONFI
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x2 (student, teacher_now)")
         clip_model_student = load_clip_to_cpu(cfg)
@@ -261,10 +263,12 @@ class PHPLMOMENTUM(BaseDA):
             denom = max(self.max_epoch - 1, 1)
             beta = self.epoch / denom
             prob_fusion = beta * prob_now + (1 - beta) * prob_init
-            pseudo_label = prob_fusion.argmax(dim=-1)
+            max_probs, pseudo_label = torch.max(prob_fusion, dim=-1)
+            mask = max_probs.ge(self.confi).float()
 
         logits_u, feat_u = self.student(image_u_strong)
-        loss_u = F.cross_entropy(logits_u, pseudo_label)
+        epsilon = 1e-8
+        loss_u = (F.cross_entropy(logits_u, pseudo_label, reduction="none") * mask).sum() / (mask.sum() + epsilon)
 
         loss_mmd = MK_MMD(feat_x, feat_u)
 
@@ -285,6 +289,7 @@ class PHPLMOMENTUM(BaseDA):
             "loss_u": loss_u.item(),
             "loss_mmd": loss_mmd.item(),
             "beta": beta,
+            "mask_ratio": mask.mean().item(),
             "acc_source": compute_accuracy(logits_x, label_x)[0].item(),
             "acc_target_pseudo": compute_accuracy(logits_u, pseudo_label)[0].item(),
             "acc_target_true": compute_accuracy(logits_u, label_u)[0].item(),

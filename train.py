@@ -191,6 +191,7 @@ def extend_cfg(cfg, args):
 
         # Mean-Teacher / momentum self-training specific:
         cfg.TRAINER.PHPLMOMENTUM.EMA_MOMENTUM = 0.996  # teacher_now <- momentum*teacher_now + (1-momentum)*student
+        cfg.TRAINER.PHPLMOMENTUM.CONFI = 0.85  # confidence threshold for masking loss_u, same as PHPL.CONFI
 
 
 
