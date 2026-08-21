@@ -192,6 +192,12 @@ def extend_cfg(cfg, args):
         # Mean-Teacher / momentum self-training specific:
         cfg.TRAINER.PHPLMOMENTUM.EMA_MOMENTUM = 0.996  # teacher_now <- momentum*teacher_now + (1-momentum)*student
         cfg.TRAINER.PHPLMOMENTUM.CONFI = 0.85  # confidence threshold for masking loss_u, same as PHPL.CONFI
+        # loss_u weighting strategy:
+        #   "mask" (default): PHPL's own strategy -- average CE only over samples
+        #       whose confidence clears CONFI (can hit 0 if none clear it in a batch).
+        #   "ratio": never drop samples -- scale the WHOLE batch's CE by the fraction
+        #       that clears CONFI. Opt-in only, via TRAINER.PHPLMOMENTUM.LOSS_U_MODE ratio.
+        cfg.TRAINER.PHPLMOMENTUM.LOSS_U_MODE = "mask"
 
 
 
