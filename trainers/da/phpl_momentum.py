@@ -72,9 +72,15 @@ def _copy_lora_params(src_model, dst_model):
 
 @torch.no_grad()
 def _ema_update_lora_params(ema_model, src_model, momentum):
+    """Accumulate in float32 before writing back. With momentum close to 1, the
+    (1 - momentum) * src increment is small and silently rounds away to nothing
+    if the update is done directly on fp16 tensors -- which freezes the EMA
+    teacher at its initial value for the whole run."""
     ema_state = ema_model.state_dict()
     for k, v in _lora_param_items(src_model):
-        ema_state[k].mul_(momentum).add_(v, alpha=1.0 - momentum)
+        ema_param = ema_state[k]
+        updated = ema_param.float().mul_(momentum).add_(v.float(), alpha=1.0 - momentum)
+        ema_param.copy_(updated.to(ema_param.dtype))
 
 
 @TRAINER_REGISTRY.register()
