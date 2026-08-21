@@ -119,19 +119,25 @@ class LoRALayer():
         for param_name, lora_name in self.params_with_lora.items():
             p = set_param(self, param_name, mode='get')
             # detach() is very important here
-            
-            p_new = p.detach() + self.merge_BA(param_name) * self.scaling
+            # lora_A/lora_B may be fp32 (kept that way on purpose so gradient/EMA
+            # accumulation doesn't underflow) while p is fp16 -- cast the delta down
+            # to p's dtype so the two combine into a dtype matching the rest of the
+            # (fp16) network, instead of silently upcasting p to fp32.
+            delta = (self.merge_BA(param_name) * self.scaling).to(p.dtype)
+            p_new = p.detach() + delta
             set_param(self, param_name, param=p_new, mode='update')
 
     def add_lora_data(self):
         r"""NOT differentiable"""
         for param_name, lora_name in self.params_with_lora.items():
-            eval(f'self.{param_name}').data += self.merge_BA(param_name) * self.scaling
-    
+            p = eval(f'self.{param_name}')
+            p.data += (self.merge_BA(param_name) * self.scaling).to(p.dtype)
+
     def sub_lora_data(self):
         r"""NOT differentiable"""
         for param_name, lora_name in self.params_with_lora.items():
-            eval(f'self.{param_name}').data -= self.merge_BA(param_name) * self.scaling
+            p = eval(f'self.{param_name}')
+            p.data -= (self.merge_BA(param_name) * self.scaling).to(p.dtype)
             
     
     def lora_train(self, mode: bool = True):
@@ -198,7 +204,10 @@ class LinearLoRA(nn.Linear, LoRALayer):
             x = self.dropout(x)
 
         if self.r > 0 and not self.merged:
-            lora_adjustment = torch.matmul(x, self.merge_BA('weight').transpose(0, 1)) * self.scaling
+            # merge_BA may come back fp32 (lora_A/lora_B are kept fp32 on purpose);
+            # cast down to x's dtype (fp16) before the matmul.
+            lora_delta = self.merge_BA('weight').to(x.dtype)
+            lora_adjustment = torch.matmul(x, lora_delta.transpose(0, 1)) * self.scaling
             result = original_output + lora_adjustment
         else:
             result = original_output
@@ -457,6 +466,21 @@ class Conv3d(nn.Conv3d, LoRALayer):
             return nn.Conv3d.forward(self, x, **kwargs)
 
 
+def _half_except_lora(module):
+    """Cast everything in `module` to fp16 except its LoRA A/B factors.
+
+    LoRA A/B are registered as fp32 by LoRALayer.init_lora_param() (see the SVD
+    init above) -- this keeps them fp32 so gradient descent and EMA updates
+    accumulate without the underflow that plain fp16 leaves would suffer, while
+    the frozen/residual weight (and everything downstream) stays fp16 to match
+    the rest of the network.
+    """
+    for name, param in module.named_parameters():
+        if "lora_" not in name:
+            param.data = param.data.half()
+    return module
+
+
 class PlainMultiheadAttentionLoRA(nn.Module):
     def __init__(
             self,
@@ -515,32 +539,32 @@ class PlainMultiheadAttentionLoRA(nn.Module):
         
         LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, dropout_rate=dropout_rate)
         
-        # Init qkv as a new lora linear layer 
+        # Init qkv as a new lora linear layer
         for item in enable_lora:
             if item == 'q':
-                self.q_proj = LinearLoRA(self.q_proj,
+                self.q_proj = _half_except_lora(LinearLoRA(self.q_proj,
                                          r=r,
                                          lora_alpha=lora_alpha,
                                          fan_in_fan_out=False,
-                                         dropout_rate = dropout_rate).half()
+                                         dropout_rate = dropout_rate))
             elif item == 'k':
-                self.k_proj = LinearLoRA(self.k_proj,
+                self.k_proj = _half_except_lora(LinearLoRA(self.k_proj,
                                          r=r,
                                          lora_alpha=lora_alpha,
                                          fan_in_fan_out=False,
-                                         dropout_rate = dropout_rate).half()
+                                         dropout_rate = dropout_rate))
             elif item == 'v':
-                self.v_proj = LinearLoRA(self.v_proj,
+                self.v_proj = _half_except_lora(LinearLoRA(self.v_proj,
                                          r=r,
                                          lora_alpha=lora_alpha,
                                          fan_in_fan_out=False,
-                                         dropout_rate = dropout_rate).half()
+                                         dropout_rate = dropout_rate))
             elif item == 'o':
-                self.proj = LinearLoRA(self.proj,
+                self.proj = _half_except_lora(LinearLoRA(self.proj,
                                          r=r,
                                          lora_alpha=lora_alpha,
                                          fan_in_fan_out=False,
-                                         dropout_rate = dropout_rate).half()
+                                         dropout_rate = dropout_rate))
         
     def forward_module(
             self,
