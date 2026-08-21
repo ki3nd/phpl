@@ -158,6 +158,40 @@ def extend_cfg(cfg, args):
         cfg.TRAINER.PHPL.ADAPTER_DIM = 32
         cfg.TRAINER.PHPL.ADAPTER_SCALE = 0.1
 
+    elif args.trainer == 'PHPLMOMENTUM':
+        cfg.TRAINER.PHPLMOMENTUM = CN()
+        cfg.TRAINER.PHPLMOMENTUM.PREC = "fp16"
+        cfg.TRAINER.PHPLMOMENTUM.DROPOUT = 0.0
+        cfg.TRAINER.PHPLMOMENTUM.DEEP_LAYERS = None
+        cfg.TRAINER.PHPLMOMENTUM.SHARE_LAYER = cfg.TRAINER.PHPLMOMENTUM.DEEP_LAYERS
+
+        cfg.TRAINER.PHPLMOMENTUM.TP = True
+        cfg.TRAINER.PHPLMOMENTUM.T_DEEP = True
+        cfg.TRAINER.PHPLMOMENTUM.CSC = False
+        cfg.TRAINER.PHPLMOMENTUM.N_CTX = 2
+        cfg.TRAINER.PHPLMOMENTUM.CTX_INIT = "a photo of a"
+        cfg.TRAINER.PHPLMOMENTUM.CLASS_TOKEN_POSITION = "end"
+
+        cfg.TRAINER.PHPLMOMENTUM.VP = True
+        cfg.TRAINER.PHPLMOMENTUM.V_DEEP = cfg.TRAINER.PHPLMOMENTUM.T_DEEP
+        cfg.TRAINER.PHPLMOMENTUM.NUM_TOKENS = cfg.TRAINER.PHPLMOMENTUM.N_CTX
+        cfg.TRAINER.PHPLMOMENTUM.LOCATION = "middle"
+
+        cfg.TRAINER.PHPLMOMENTUM.POSITION = 'all'
+        cfg.TRAINER.PHPLMOMENTUM.PARAMS = ['q', 'k', 'v']
+        cfg.TRAINER.PHPLMOMENTUM.R = 2
+        cfg.TRAINER.PHPLMOMENTUM.RANK_RAMP = [2, 4, 6, 8, 10]
+        cfg.TRAINER.PHPLMOMENTUM.ALPHA = 1
+        cfg.TRAINER.PHPLMOMENTUM.DROPOUT_RATE = 0.25
+
+        cfg.TRAINER.PHPLMOMENTUM.ADAPTER_START = 4
+        cfg.TRAINER.PHPLMOMENTUM.ADAPTER_END = 12
+        cfg.TRAINER.PHPLMOMENTUM.ADAPTER_DIM = 32
+        cfg.TRAINER.PHPLMOMENTUM.ADAPTER_SCALE = 0.1
+
+        # Mean-Teacher / momentum self-training specific:
+        cfg.TRAINER.PHPLMOMENTUM.EMA_MOMENTUM = 0.996  # teacher_now <- momentum*teacher_now + (1-momentum)*student
+
 
 
 def setup_cfg(args):

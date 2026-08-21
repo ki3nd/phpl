@@ -5,5 +5,6 @@ from .clip.clip_lplr import CLIP_LR
 
 from .vlp.ivlp import IVLP
 from trainers.da.phpl import PHPL
+from trainers.da.phpl_momentum import PHPLMOMENTUM
 
 
