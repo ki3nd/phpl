@@ -206,6 +206,12 @@ def extend_cfg(cfg, args):
         # teacher_init's (frozen anchor's) influence drops off sooner.
         cfg.TRAINER.PHPLMOMENTUM.BETA_POWER = 1.0
 
+        # False (default): student and teachers all see PHPL's own single
+        # augmentation pipeline (cfg.INPUT.TRANSFORMS) -- no weak/strong split.
+        # True: student sees a strong-aug view (+ randaugment) of the target
+        # image, teachers see a weak-aug view (without it).
+        cfg.TRAINER.PHPLMOMENTUM.USE_STRONG_AUG = False
+
         # CutMix between source (image_x) and target (image_u_strong), both strong-aug:
         # adds an extra loss_mix term (opt-in, default off, doesn't change existing behavior).
         cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX = False

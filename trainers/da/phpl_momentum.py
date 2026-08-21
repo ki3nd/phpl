@@ -33,7 +33,9 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
         CONFI), so confidence still gates how much loss_u matters but never zeroes it
         out just because no single sample individually clears CONFI. Opt-in only.
   - Student sees strong-augmented target/source images; the teacher sees a weak-augmented
-    target view (asymmetric-view self-training, reduces confirmation bias).
+    target view (asymmetric-view self-training, reduces confirmation bias) -- but only if
+    cfg.TRAINER.PHPLMOMENTUM.USE_STRONG_AUG is set True. Default (False) is no weak/strong
+    split at all: student and teachers all see PHPL's own single augmentation pipeline.
   - loss_mmd (Multi-Kernel MMD between source/target student features) is kept, same as PHPL.
   - Optional CutMix (cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX, default off): cuts a random box
     out of image_u_strong and pastes it into image_x (both already strong-aug), and adds
@@ -256,17 +258,25 @@ class PHPLMOMENTUM(BaseDA):
     def build_data_loader(self):
         """Override: student gets a strong-aug view ("img"), both teachers get a weak-aug
         view ("img2") of the same image. train_loader_x also carries both views for
-        uniformity, but only "img" is used for the source CE loss."""
+        uniformity, but only "img" is used for the source CE loss.
+
+        If TRAINER.PHPLMOMENTUM.USE_STRONG_AUG is False (default), "img" and "img2"
+        are instead both built from PHPL's own single augmentation pipeline
+        (cfg.INPUT.TRANSFORMS) -- no weak/strong split at all."""
         cfg = self.cfg
-        strong_tfm = build_transform(
-            cfg, is_train=True,
-            choices=["random_resized_crop", "random_flip", "randaugment", "normalize"],
-        )
-        weak_tfm = build_transform(
-            cfg, is_train=True,
-            choices=["random_resized_crop", "random_flip", "normalize"],
-        )
-        dm = DataManager(cfg, custom_tfm_train=(strong_tfm, weak_tfm))
+        if cfg.TRAINER.PHPLMOMENTUM.USE_STRONG_AUG:
+            tfm1 = build_transform(
+                cfg, is_train=True,
+                choices=["random_resized_crop", "random_flip", "randaugment", "normalize"],
+            )
+            tfm2 = build_transform(
+                cfg, is_train=True,
+                choices=["random_resized_crop", "random_flip", "normalize"],
+            )
+        else:
+            tfm1 = build_transform(cfg, is_train=True)
+            tfm2 = tfm1
+        dm = DataManager(cfg, custom_tfm_train=(tfm1, tfm2))
 
         self.train_loader_x = dm.train_loader_x
         self.train_loader_u = dm.train_loader_u
