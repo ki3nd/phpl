@@ -33,7 +33,11 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
   - Student sees strong-augmented target/source images; the teacher sees a weak-augmented
     target view (asymmetric-view self-training, reduces confirmation bias).
   - loss_mmd (Multi-Kernel MMD between source/target student features) is kept, same as PHPL.
-  - Evaluation uses teacher_now (the adapting EMA teacher), not the student.
+  - Evaluation uses teacher_now (the adapting EMA teacher), not the student. save_model/
+    load_model persist teacher_now's own LoRA snapshot directly (a separate "TeacherNow"
+    checkpoint dir, alongside "Student") -- reconstructing it by re-copying student's
+    weights at load time would give a DIFFERENT (raw, non-EMA'd) model than whatever
+    teacher_now's EMA state actually was when that epoch's eval score was recorded.
 """
 import os.path as osp
 
@@ -145,7 +149,10 @@ class PHPLMOMENTUM(BaseDA):
         is_vit = cfg.MODEL.BACKBONE.NAME.split('-')[0] == 'ViT'
         apply_fn = apply_lora if is_vit else apply_lora_rn
         self.list_lora_layers = apply_fn(cfg, self.student)
-        apply_fn(cfg, self.teacher_now)
+        # Keep teacher_now's own LoRA layer list too -- save_model/load_model need
+        # it to persist/restore teacher_now's actual EMA state directly (test()
+        # evaluates teacher_now, not student, so that's what "best model" must mean).
+        self.list_lora_layers_teacher_now = apply_fn(cfg, self.teacher_now)
 
         print("Freezing everything except student's LoRA parameters...")
         for model in (self.student, self.teacher_now, self.teacher_init):
@@ -327,10 +334,17 @@ class PHPLMOMENTUM(BaseDA):
         return results["accuracy"]
 
     def save_model(self, epoch, directory, is_best=False, model_name=""):
-        save_dir = osp.join(directory, "Student")
-        mkdir_if_missing(save_dir)
         filename = "LoRA-best" if model_name != "" else "LoRA-last"
-        save_lora(self.cfg, self.list_lora_layers, save_dir, filename=filename)
+
+        student_dir = osp.join(directory, "Student")
+        mkdir_if_missing(student_dir)
+        save_lora(self.cfg, self.list_lora_layers, student_dir, filename=filename)
+
+        # test()/eval evaluates teacher_now, not student -- "best model" must mean
+        # teacher_now's actual EMA state at that point, not student's raw weights.
+        teacher_now_dir = osp.join(directory, "TeacherNow")
+        mkdir_if_missing(teacher_now_dir)
+        save_lora(self.cfg, self.list_lora_layers_teacher_now, teacher_now_dir, filename=filename)
 
     def load_model(self, directory, epoch=None):
         if not directory:
@@ -338,4 +352,4 @@ class PHPLMOMENTUM(BaseDA):
             return
         filename = "LoRA-last" if epoch is not None else "LoRA-best"
         load_lora(self.cfg, self.list_lora_layers, osp.join(directory, "Student"), filename=filename)
-        _copy_lora_params(self.student, self.teacher_now)
+        load_lora(self.cfg, self.list_lora_layers_teacher_now, osp.join(directory, "TeacherNow"), filename=filename)
