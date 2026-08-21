@@ -33,9 +33,3 @@ TEST:
 MODEL:
   BACKBONE:
     NAME: "ViT-B/16"
-
-TRAINER:
-  MAPLE:
-    N_CTX: 2
-    CTX_INIT: "a photo of a"
-    PREC: "fp16"
