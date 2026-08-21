@@ -10,11 +10,12 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
     This saves a full extra CLIP backbone copy in memory.
   - teacher_now's LoRA weights are updated by EMA/momentum from student's LoRA after every
     step (no gradient, no optimizer) -- classic Mean-Teacher.
-  - Pseudo-label for the student comes from a probability-space blend of "teacher_now
-    with LoRA" and "teacher_now with LoRA bypassed" (the t=0 anchor):
+  - Pseudo-label for the student comes from a logit-space blend of "teacher_now with
+    LoRA" and "teacher_now with LoRA bypassed" (the t=0 anchor) -- same formula as
+    PHPL's CustomCLIP.forward:
         beta = epoch / (max_epoch - 1)
-        prob_fusion = beta * softmax(teacher_now_logits) + (1 - beta) * softmax(teacher_init_logits)
-        pseudo_label = argmax(prob_fusion)
+        logits_fusion = beta * teacher_now_logits + (1 - beta) * teacher_init_logits
+        pseudo_label = argmax(softmax(logits_fusion))
     beta ramps 0 -> 1 across training, so pseudo-labels lean on the stable anchor early
     and on the adapting teacher_now later.
   - loss_u is masked exactly like PHPL's CONFI: only target samples where the fused
@@ -257,12 +258,14 @@ class PHPLMOMENTUM(BaseDA):
             with _lora_bypassed(self.teacher_now):
                 logits_teacher_init, _ = self.teacher_now(image_u_weak)
 
-            prob_now = F.softmax(logits_teacher_now, dim=-1)
-            prob_init = F.softmax(logits_teacher_init, dim=-1)
-
             denom = max(self.max_epoch - 1, 1)
             beta = self.epoch / denom
-            prob_fusion = beta * prob_now + (1 - beta) * prob_init
+            # Fuse in logit space, softmax once -- same as PHPL's CustomCLIP.forward
+            # (softmax(a*x+b*y) is a weighted GEOMETRIC mean of softmax(x)/softmax(y),
+            # not an arithmetic mean of two already-softmaxed distributions; CONFI was
+            # calibrated against this sharper geometric-mean formula).
+            logits_fusion = beta * logits_teacher_now + (1 - beta) * logits_teacher_init
+            prob_fusion = F.softmax(logits_fusion, dim=-1)
             max_probs, pseudo_label = torch.max(prob_fusion, dim=-1)
             mask = max_probs.ge(self.confi).float()
 
