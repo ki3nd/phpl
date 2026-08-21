@@ -260,23 +260,27 @@ class PHPLMOMENTUM(BaseDA):
         view ("img2") of the same image. train_loader_x also carries both views for
         uniformity, but only "img" is used for the source CE loss.
 
-        If TRAINER.PHPLMOMENTUM.USE_STRONG_AUG is False (default), "img" and "img2"
-        are instead both built from PHPL's own single augmentation pipeline
-        (cfg.INPUT.TRANSFORMS) -- no weak/strong split at all."""
+        If TRAINER.PHPLMOMENTUM.USE_STRONG_AUG is False (default), no custom_tfm_train
+        tuple is passed at all -- DataManager falls back to its own single default
+        transform (cfg.INPUT.TRANSFORMS), producing only an "img" key with ONE random
+        augmentation draw per sample, exactly like PHPL. A tuple of two transforms
+        (even if both are literally the same object) always makes Dassl's
+        DatasetWrapper.__getitem__ apply the transform TWICE independently, producing
+        two DIFFERENT random augmentations of the same image under "img"/"img2" --
+        not a match for PHPL's single-draw behavior."""
         cfg = self.cfg
         if cfg.TRAINER.PHPLMOMENTUM.USE_STRONG_AUG:
-            tfm1 = build_transform(
+            strong_tfm = build_transform(
                 cfg, is_train=True,
                 choices=["random_resized_crop", "random_flip", "randaugment", "normalize"],
             )
-            tfm2 = build_transform(
+            weak_tfm = build_transform(
                 cfg, is_train=True,
                 choices=["random_resized_crop", "random_flip", "normalize"],
             )
+            dm = DataManager(cfg, custom_tfm_train=(strong_tfm, weak_tfm))
         else:
-            tfm1 = build_transform(cfg, is_train=True)
-            tfm2 = tfm1
-        dm = DataManager(cfg, custom_tfm_train=(tfm1, tfm2))
+            dm = DataManager(cfg)
 
         self.train_loader_x = dm.train_loader_x
         self.train_loader_u = dm.train_loader_u
@@ -293,7 +297,12 @@ class PHPLMOMENTUM(BaseDA):
         image_x = batch_x["img"].to(self.device)
         label_x = batch_x["label"].to(self.device)
         image_u_strong = batch_u["img"].to(self.device)
-        image_u_weak = batch_u["img2"].to(self.device)
+        if self.cfg.TRAINER.PHPLMOMENTUM.USE_STRONG_AUG:
+            image_u_weak = batch_u["img2"].to(self.device)
+        else:
+            # No "img2" key exists (see build_data_loader) -- teacher and student
+            # see the exact same single augmented draw, matching PHPL exactly.
+            image_u_weak = image_u_strong
         label_u = batch_u["label"].to(self.device)
         return image_x, label_x, image_u_strong, image_u_weak, label_u
 
