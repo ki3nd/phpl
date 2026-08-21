@@ -212,6 +212,18 @@ def extend_cfg(cfg, args):
         # image, teachers see a weak-aug view (without it).
         cfg.TRAINER.PHPLMOMENTUM.USE_STRONG_AUG = False
 
+        # Logit-adjustment debiasing (UniMoS-style, cf. DebiasPL) against CLIP's own
+        # zero-shot class bias: subtract tau*log(qhat) from a teacher's logits before
+        # fusing/pseudo-labeling, where qhat is a SINGLE EMA running estimate (shared
+        # between teacher_now and teacher_init, assuming they share roughly the same
+        # bias pattern) of the average predicted class distribution on target data --
+        # not the true label distribution, purely self-referential. Default off;
+        # UniMoS's own defaults (tau=0.5, momen=0.99) carried over as this trainer's
+        # defaults for TAU/MOMENTUM.
+        cfg.TRAINER.PHPLMOMENTUM.USE_DEBIAS = False
+        cfg.TRAINER.PHPLMOMENTUM.DEBIAS_TAU = 0.5
+        cfg.TRAINER.PHPLMOMENTUM.DEBIAS_MOMENTUM = 0.99
+
         # CutMix between source (image_x) and target (image_u_strong), both strong-aug:
         # adds an extra loss_mix term (opt-in, default off, doesn't change existing behavior).
         cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX = False

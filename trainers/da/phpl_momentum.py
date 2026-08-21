@@ -41,6 +41,11 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
     out of image_u_strong and pastes it into image_x (both already strong-aug), and adds
     an extra loss_mix = lam*CE(pred_mix, label_x) + (1-lam)*CE(pred_mix, pseudo_label) to
     the total loss, where lam is the fraction of the mixed image that stayed source.
+  - Optional debiasing (cfg.TRAINER.PHPLMOMENTUM.USE_DEBIAS, default off): a single EMA
+    tracker (self.qhat, shared between teacher_now and teacher_init) estimates how often
+    the teachers' own predictions land on each class; DEBIAS_TAU * log(qhat) is subtracted
+    from BOTH teachers' logits before fusion, to counteract systematic class bias inherited
+    from CLIP's zero-shot behavior (not the true target-domain class distribution).
   - Evaluation uses teacher_now (the adapting EMA teacher), not the student. save_model/
     load_model persist teacher_now's own LoRA snapshot directly (a separate "TeacherNow"
     checkpoint dir, alongside "Student") -- reconstructing it by re-copying student's
@@ -175,6 +180,13 @@ class PHPLMOMENTUM(BaseDA):
         self.use_cutmix = cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX
         self.cutmix_alpha = cfg.TRAINER.PHPLMOMENTUM.CUTMIX_ALPHA
         self.beta_power = cfg.TRAINER.PHPLMOMENTUM.BETA_POWER
+
+        self.use_debias = cfg.TRAINER.PHPLMOMENTUM.USE_DEBIAS
+        self.debias_tau = cfg.TRAINER.PHPLMOMENTUM.DEBIAS_TAU
+        self.debias_momentum = cfg.TRAINER.PHPLMOMENTUM.DEBIAS_MOMENTUM
+        if self.use_debias:
+            # Single EMA tracker shared between teacher_now and teacher_init.
+            self.qhat = torch.full((self.num_classes,), 1.0 / self.num_classes, device=self.device)
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x3 (student, teacher_now, teacher_init)")
         clip_model_student = load_clip_to_cpu(cfg)
@@ -326,6 +338,23 @@ class PHPLMOMENTUM(BaseDA):
             # sqrt) makes beta rise faster early on, so teacher_init's influence
             # drops off sooner than the linear schedule.
             beta = (self.epoch / denom) ** self.beta_power
+
+            if self.use_debias:
+                # Logit-adjustment debiasing (UniMoS/DebiasPL-style) against CLIP's
+                # own zero-shot class bias -- see train.py's USE_DEBIAS comment.
+                # Update qhat from the RAW (pre-debias) predictions of both teachers,
+                # weighted by how much each actually contributes to the fused
+                # pseudo-label (the same beta used below), then apply the SAME
+                # correction (from BEFORE this update) to both teachers' logits.
+                prob_now_raw = F.softmax(logits_teacher_now, dim=-1)
+                prob_init_raw = F.softmax(logits_teacher_init, dim=-1)
+
+                logits_teacher_now = logits_teacher_now - self.debias_tau * torch.log(self.qhat)
+                logits_teacher_init = logits_teacher_init - self.debias_tau * torch.log(self.qhat)
+
+                combined_prob = beta * prob_now_raw + (1 - beta) * prob_init_raw
+                self.qhat = self.debias_momentum * self.qhat + (1 - self.debias_momentum) * combined_prob.mean(dim=0)
+
             # Fuse in logit space, softmax once -- same as PHPL's CustomCLIP.forward
             # (softmax(a*x+b*y) is a weighted GEOMETRIC mean of softmax(x)/softmax(y),
             # not an arithmetic mean of two already-softmaxed distributions; CONFI was
