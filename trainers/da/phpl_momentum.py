@@ -232,7 +232,12 @@ def _text_features(model):
 
 class _MLPHead(nn.Module):
     """Small learned classifier on top of image features -- CMKD's own
-    (VLP-UDA-style) alternative to CLIP's fixed cosine-similarity classification."""
+    (VLP-UDA-style) alternative to CLIP's fixed cosine-similarity classification.
+    Stays fp32 (default nn.Linear dtype, never cast to half) -- same reasoning as
+    keeping LoRA A/B fp32 despite the frozen CLIP backbone being fp16: a small,
+    freshly-initialized, EMA-updated component benefits from full precision.
+    Callers must cast the incoming image feature to fp32 (.float()) before
+    calling this, since CLIP's own image_features are fp16 by default."""
 
     def __init__(self, feat_dim, hidden_dim, num_classes):
         super().__init__()
@@ -798,10 +803,10 @@ class PHPLMOMENTUM(BaseDA):
             # against prob_fusion -- the SAME beta-blended teacher_now/teacher_init
             # probability already computed above for the CONFI/threshold mask, reused
             # here rather than recomputed (already detached, under no_grad).
-            mlp_logits_x = self.student_mlp(feat_x)
+            mlp_logits_x = self.student_mlp(feat_x.float())
             mlp_loss_x = F.cross_entropy(mlp_logits_x, label_x)
 
-            mlp_logits_u = self.student_mlp(feat_u)
+            mlp_logits_u = self.student_mlp(feat_u.float())
             pred_mlp_u = F.softmax(mlp_logits_u, dim=1)
             pred_teacher_u = prob_fusion
             coe = _calibrated_coefficient(pred_mlp_u, pred_teacher_u)
@@ -882,7 +887,7 @@ class PHPLMOMENTUM(BaseDA):
                 # Diagnostic only -- not the official metric, not used for
                 # best-model selection. Manual accuracy, not the full evaluator
                 # machinery (per-class/confusion-matrix stats not needed here).
-                mlp_logits = self.teacher_now_mlp(feat)
+                mlp_logits = self.teacher_now_mlp(feat.float())
                 mlp_correct += (mlp_logits.argmax(dim=-1) == label).sum().item()
                 mlp_total += label.size(0)
 
