@@ -310,6 +310,24 @@ def extend_cfg(cfg, args):
         #       -- it depresses their threshold even further below linear.
         cfg.TRAINER.PHPLMOMENTUM.FLEXMATCH_MAPPING = "linear"
 
+        # "cbst" mode (THRESHOLD_MODE): Class-Balanced Self-Training (Zou et al.,
+        # ECCV 2018). Unlike "flexmatch"/"flexmatch_v2", which compare classes'
+        # confidence RELATIVE to each other (a rarely-confident class collapses
+        # toward tau_c=0), CBST picks, independently for EACH class, the confidence
+        # value at the top `portion` fraction among ONLY the samples currently
+        # predicted as that class -- every class always keeps its own top
+        # `portion`*100% of predictions, regardless of how confident other classes
+        # are. Recomputed once per epoch (before_epoch, not every batch/iteration):
+        # scans the WHOLE target set with the frozen teacher_init on epoch 1 (no
+        # meaningfully-adapted teacher_now yet) or teacher_now from epoch 2 on,
+        # ranks each class's own confidences, and sets tau_c to the value at the
+        # portion-th percentile (top `portion` kept). A class with zero predicted
+        # samples this epoch falls back to CONFI. `portion` ramps linearly from
+        # CBST_PORTION_START to CBST_PORTION_MAX, reaching MAX exactly at the last
+        # configured epoch (OPTIM.MAX_EPOCH) regardless of how many epochs that is.
+        cfg.TRAINER.PHPLMOMENTUM.CBST_PORTION_START = 0.20
+        cfg.TRAINER.PHPLMOMENTUM.CBST_PORTION_MAX = 0.50
+
         # CutMix between source (image_x) and target (image_u_strong), both strong-aug:
         # adds an extra loss_mix term (opt-in, default off, doesn't change existing behavior).
         cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX = False

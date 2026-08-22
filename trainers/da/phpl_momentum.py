@@ -63,6 +63,14 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
         separate epoch-1 gate needed) else beta_c = sigma(c) / max_c sigma(c). The
         warm-up term can leave tau_c near 0 for an entire short training run if
         sum(sigma) never approaches N -- set FLEXMATCH_WARMUP False to skip it.
+      "cbst": Class-Balanced Self-Training (Zou et al., ECCV 2018). Unlike the
+        flexmatch modes (relative between classes), CBST independently picks each
+        class's OWN top `portion` fraction of confidences among samples currently
+        predicted as that class -- never collapses toward 0 for a rarely-confident
+        class. Recomputed once per epoch (before_epoch), scanning the WHOLE target
+        set with teacher_init (epoch 1) or teacher_now (epoch 2+); a class with no
+        predictions that epoch falls back to CONFI. `portion` ramps linearly from
+        CBST_PORTION_START to CBST_PORTION_MAX, hitting MAX at the last epoch.
         New threshold strategies should be added as new modes here, not new flags.
   - Student sees strong-augmented target/source images; the teacher sees a weak-augmented
     target view (asymmetric-view self-training, reduces confirmation bias) -- but only if
@@ -102,6 +110,7 @@ from torch.nn import functional as F
 
 from dassl.engine import TRAINER_REGISTRY
 from dassl.data import DataManager
+from dassl.data.data_manager import build_data_loader
 from dassl.data.transforms import build_transform
 from dassl.metrics import compute_accuracy
 from dassl.utils import mkdir_if_missing
@@ -285,10 +294,10 @@ class PHPLMOMENTUM(BaseDA):
         self.scl_image_weight = cfg.TRAINER.PHPLMOMENTUM.SCL_IMAGE_WEIGHT
 
         self.threshold_mode = cfg.TRAINER.PHPLMOMENTUM.THRESHOLD_MODE
-        if self.threshold_mode not in ("fixed", "flexmatch", "flexmatch_v2"):
+        if self.threshold_mode not in ("fixed", "flexmatch", "flexmatch_v2", "cbst"):
             raise ValueError(
                 f"Unknown TRAINER.PHPLMOMENTUM.THRESHOLD_MODE: {self.threshold_mode!r} "
-                "(expected 'fixed', 'flexmatch', or 'flexmatch_v2')"
+                "(expected 'fixed', 'flexmatch', 'flexmatch_v2', or 'cbst')"
             )
         if self.threshold_mode == "flexmatch":
             # Running per-class confident-prediction count, never reset -- see
@@ -306,6 +315,20 @@ class PHPLMOMENTUM(BaseDA):
             num_unlabeled = len(self.dm.dataset.train_u)
             self.selected_label = torch.full((num_unlabeled,), -1, dtype=torch.long, device=self.device)
             self.flexmatch_warmup = cfg.TRAINER.PHPLMOMENTUM.FLEXMATCH_WARMUP
+        if self.threshold_mode == "cbst":
+            self.cbst_portion_start = cfg.TRAINER.PHPLMOMENTUM.CBST_PORTION_START
+            self.cbst_portion_max = cfg.TRAINER.PHPLMOMENTUM.CBST_PORTION_MAX
+            # Fallback threshold for any class with zero predictions in an epoch's scan.
+            self.cbst_tau = torch.full((self.num_classes,), self.confi, device=self.device)
+            tfm_test = build_transform(cfg, is_train=False)
+            self.cbst_scoring_loader = build_data_loader(
+                cfg,
+                sampler_type="SequentialSampler",
+                data_source=self.dm.dataset.train_u,
+                batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
+                tfm=tfm_test,
+                is_train=False,
+            )
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x3 (student, teacher_now, teacher_init)")
         clip_model_student = load_clip_to_cpu(cfg)
@@ -423,6 +446,50 @@ class PHPLMOMENTUM(BaseDA):
         self.lab2cname = dm.lab2cname
 
         self.dm = dm
+
+    def before_epoch(self):
+        if self.threshold_mode == "cbst":
+            self._update_cbst_thresholds()
+
+    @torch.no_grad()
+    def _update_cbst_thresholds(self):
+        """Class-Balanced Self-Training (Zou et al., ECCV 2018) -- see the class
+        docstring's THRESHOLD_MODE section. Scans the WHOLE target set once, then
+        for each class independently sets tau_c to the confidence value at the
+        top `portion` fraction among only the samples currently predicted as that
+        class. A class with zero predictions this epoch keeps its CONFI fallback
+        (self.cbst_tau was initialized to CONFI and is never reset to it here, so a
+        class that recovers later just gets overwritten again)."""
+        denom = max(self.max_epoch - 1, 1)
+        portion = min(
+            self.cbst_portion_start + self.epoch * (self.cbst_portion_max - self.cbst_portion_start) / denom,
+            self.cbst_portion_max,
+        )
+        scoring_model = self.teacher_init if self.epoch == 0 else self.teacher_now
+
+        all_max_probs, all_pred_labels = [], []
+        for batch in self.cbst_scoring_loader:
+            images = batch["img"].to(self.device)
+            logits, _ = scoring_model(images)
+            probs = F.softmax(logits, dim=-1)
+            max_probs, pred_labels = torch.max(probs, dim=-1)
+            all_max_probs.append(max_probs)
+            all_pred_labels.append(pred_labels)
+        all_max_probs = torch.cat(all_max_probs)
+        all_pred_labels = torch.cat(all_pred_labels)
+
+        for c in range(self.num_classes):
+            conf_c = all_max_probs[all_pred_labels == c]
+            if conf_c.numel() == 0:
+                continue  # keep the existing (CONFI-initialized) fallback for this class
+            sorted_conf, _ = torch.sort(conf_c, descending=True)
+            idx = min(int(sorted_conf.numel() * portion), sorted_conf.numel() - 1)
+            self.cbst_tau[c] = sorted_conf[idx]
+
+        print(
+            f"[cbst] epoch {self.epoch + 1}: portion={portion:.3f}, "
+            f"tau_c=[{', '.join(f'{v:.3f}' for v in self.cbst_tau.tolist())}]"
+        )
 
     def parse_batch_train(self, batch_x, batch_u):
         image_x = batch_x["img"].to(self.device)
@@ -547,6 +614,10 @@ class PHPLMOMENTUM(BaseDA):
                 if (self.batch_idx + 1) % 10 == 0:
                     tau_list = ", ".join(f"{v:.3f}" for v in tau_c.tolist())
                     print(f"[flexmatch_v2 tau_c] epoch {self.epoch + 1} batch {self.batch_idx + 1}: [{tau_list}]")
+            elif self.threshold_mode == "cbst":
+                # self.cbst_tau was computed once for the whole epoch in
+                # before_epoch() -- no per-batch update here.
+                mask = max_probs.ge(self.cbst_tau[pseudo_label]).float()
             else:
                 mask = confident
 
