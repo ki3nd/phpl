@@ -270,9 +270,19 @@ def extend_cfg(cfg, args):
         #       denominator, keeping every beta_c small instead of letting one class
         #       spike to 1 just because it happens to have a few early confident hits.
         #       No separate epoch-1 warmup needed -- this formula's warm-up applies
-        #       from iteration 1.
+        #       from iteration 1. See FLEXMATCH_WARMUP below to disable this term.
         # Add new strategies as new elif branches in forward_backward, not new flags.
         cfg.TRAINER.PHPLMOMENTUM.THRESHOLD_MODE = "fixed"
+
+        # "flexmatch_v2" only: include the paper's N-sum(sigma) warm-up term in the
+        # denominator (True, default/faithful) or drop it, using denom=max_c sigma(c)
+        # alone (False). The paper's own SSL experiments run for up to 2^20
+        # iterations, giving the warm-up plenty of time to fade as sum(sigma)
+        # approaches N; our short (~10 epoch) DA training budget may never
+        # accumulate enough confidently-assigned samples for N-sum(sigma) to shrink
+        # below max_c sigma(c), leaving every tau_c stuck near 0 (observed
+        # empirically) for the whole run -- set False to skip that regime entirely.
+        cfg.TRAINER.PHPLMOMENTUM.FLEXMATCH_WARMUP = True
 
         # "flexmatch"/"flexmatch_v2" only: how beta_c maps to a threshold multiplier.
         #   "linear" (default, unchanged): tau_c = beta_c * CONFI.

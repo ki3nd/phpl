@@ -53,8 +53,11 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
         revisited across many epochs is only ever counted once, at its most recent
         assignment -- fixes "flexmatch"'s tendency for tau_c to drift upward forever
         with epoch count. sigma(c) = count of slots == c; beta_c = sigma(c) /
-        max(max_c sigma(c), N - sum(sigma)) -- the paper's own warm-up term, active
-        from iteration 1 (no separate epoch-1 gate needed).
+        max(max_c sigma(c), N - sum(sigma)) if cfg.TRAINER.PHPLMOMENTUM.FLEXMATCH_WARMUP
+        (default True, the paper's own warm-up term, active from iteration 1, no
+        separate epoch-1 gate needed) else beta_c = sigma(c) / max_c sigma(c). The
+        warm-up term can leave tau_c near 0 for an entire short training run if
+        sum(sigma) never approaches N -- set FLEXMATCH_WARMUP False to skip it.
         New threshold strategies should be added as new modes here, not new flags.
   - Student sees strong-augmented target/source images; the teacher sees a weak-augmented
     target view (asymmetric-view self-training, reduces confirmation bias) -- but only if
@@ -257,6 +260,7 @@ class PHPLMOMENTUM(BaseDA):
             # see train.py's THRESHOLD_MODE comment for the exact FlexMatch formula.
             num_unlabeled = len(self.dm.dataset.train_u)
             self.selected_label = torch.full((num_unlabeled,), -1, dtype=torch.long, device=self.device)
+            self.flexmatch_warmup = cfg.TRAINER.PHPLMOMENTUM.FLEXMATCH_WARMUP
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x3 (student, teacher_now, teacher_init)")
         clip_model_student = load_clip_to_cpu(cfg)
@@ -478,11 +482,17 @@ class PHPLMOMENTUM(BaseDA):
                 sigma = torch.bincount(
                     self.selected_label[self.selected_label >= 0], minlength=self.num_classes
                 ).float()
-                n_unused = (self.selected_label < 0).sum().float()
-                # Paper's own warm-up (Eq. 11): while most samples are still
-                # unassigned, N-sum(sigma) dominates the denominator, keeping every
-                # beta_c small instead of one class spiking to 1 from a few early hits.
-                denom = torch.maximum(sigma.max(), n_unused).clamp(min=1.0)
+                if self.flexmatch_warmup:
+                    # Paper's own warm-up (Eq. 11): while most samples are still
+                    # unassigned, N-sum(sigma) dominates the denominator, keeping
+                    # every beta_c small instead of one class spiking to 1 from a
+                    # few early hits. Can leave tau_c near 0 for the WHOLE run if
+                    # sum(sigma) never gets close to N within a short training
+                    # budget -- see FLEXMATCH_WARMUP in train.py.
+                    n_unused = (self.selected_label < 0).sum().float()
+                    denom = torch.maximum(sigma.max(), n_unused).clamp(min=1.0)
+                else:
+                    denom = sigma.max().clamp(min=1.0)
                 beta_c = sigma / denom
                 if self.flexmatch_mapping == "convex":
                     beta_c = beta_c / (2.0 - beta_c)
