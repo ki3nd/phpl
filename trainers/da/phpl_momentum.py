@@ -78,7 +78,10 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
         class. Recomputed once per epoch (before_epoch), scanning the WHOLE target
         set with teacher_init (epoch 1) or teacher_now (epoch 2+); a class with no
         predictions that epoch falls back to CONFI. `portion` ramps linearly from
-        CBST_PORTION_START to CBST_PORTION_MAX, hitting MAX at the last epoch.
+        CBST_PORTION_START to CBST_PORTION_MAX, hitting MAX at the last epoch. The
+        scan uses the SAME weak-aug transform image_u_weak uses in training (not a
+        clean/deterministic test-style transform), so it measures confidence the
+        same way the per-batch teacher forward does.
         New threshold strategies should be added as new modes here, not new flags.
   - Student sees strong-augmented target/source images; the teacher sees a weak-augmented
     target view (asymmetric-view self-training, reduces confirmation bias) -- but only if
@@ -331,13 +334,25 @@ class PHPLMOMENTUM(BaseDA):
             self.cbst_portion_max = cfg.TRAINER.PHPLMOMENTUM.CBST_PORTION_MAX
             # Fallback threshold for any class with zero predictions in an epoch's scan.
             self.cbst_tau = torch.full((self.num_classes,), self.confi, device=self.device)
-            tfm_test = build_transform(cfg, is_train=False)
+            # Match whatever transform image_u_weak actually uses in training (weak-aug,
+            # still has random_resized_crop/flip -- NOT a clean/deterministic test-style
+            # transform), so CBST's scan measures confidence the same way forward_backward's
+            # own per-batch teacher forward does. is_train=False is passed to
+            # build_data_loader itself (not the transform) only to keep drop_last=False,
+            # so the WHOLE target set gets scanned, none dropped.
+            if cfg.TRAINER.PHPLMOMENTUM.USE_STRONG_AUG:
+                tfm_scoring = build_transform(
+                    cfg, is_train=True,
+                    choices=["random_resized_crop", "random_flip", "normalize"],
+                )
+            else:
+                tfm_scoring = build_transform(cfg, is_train=True)
             self.cbst_scoring_loader = build_data_loader(
                 cfg,
                 sampler_type="SequentialSampler",
                 data_source=self.dm.dataset.train_u,
                 batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
-                tfm=tfm_test,
+                tfm=tfm_scoring,
                 is_train=False,
             )
 
