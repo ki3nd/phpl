@@ -439,6 +439,10 @@ class PHPLMOMENTUM(BaseDA):
                     beta_c = beta_c / (2.0 - beta_c)
                 tau_c = beta_c * self.confi
                 mask = max_probs.ge(tau_c[pseudo_label]).float()
+
+                if (self.batch_idx + 1) % 10 == 0:
+                    tau_list = ", ".join(f"{v:.3f}" for v in tau_c.tolist())
+                    print(f"[flexmatch tau_c] epoch {self.epoch + 1} batch {self.batch_idx + 1}: [{tau_list}]")
             else:
                 mask = confident
 
