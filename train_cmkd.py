@@ -33,6 +33,7 @@ import math
 import os.path as osp
 
 import torch
+import torch.nn as nn
 from torch.nn import functional as F
 
 from dassl.data import DataManager
@@ -40,8 +41,47 @@ from dassl.utils import mkdir_if_missing, set_random_seed
 
 from utils.clip_part import load_clip_to_cpu
 from loralib.utils import apply_lora, apply_lora_rn, load_lora
-from trainers.da.phpl_momentum import _FrozenTeacherCLIP, _MLPHead
+from trainers.da.phpl_momentum import _FrozenTeacherCLIP
 from train import setup_cfg
+
+
+def _init_classifier_weights(module):
+    """Matches VLP-UDA's weights_init_classifier (models/make_model.py) --
+    near-zero Linear init (std=0.001, instead of PyTorch's default
+    Kaiming/uniform) and BatchNorm affine params reset to identity with a
+    frozen (non-learned) bias."""
+    classname = module.__class__.__name__
+    if classname.find("Linear") != -1:
+        nn.init.normal_(module.weight, std=0.001)
+    elif classname.find("BatchNorm") != -1:
+        module.bias.requires_grad_(False)
+        if module.affine:
+            nn.init.constant_(module.weight, 1.0)
+            nn.init.constant_(module.bias, 0.0)
+
+
+class _ClassifierHead(nn.Module):
+    """VLP-UDA's own classifier_layer (models/make_model.py): BatchNorm1d ->
+    LayerNorm -> Linear (no bias, no hidden layer/ReLU) -- NOT the plain
+    Linear->ReLU->Linear _MLPHead used by the (now largely superseded)
+    trainer-integrated CMKD code in phpl_momentum.py. Normalizing the
+    already-L2-normalized (small-magnitude) CLIP feature before the Linear
+    layer is what let plain SGD train this at all: confirmed via a real run
+    that a plain Linear->ReLU->Linear head (no normalization) left mlp_loss_x
+    pinned at ln(num_classes) after hundreds of iterations -- the per-parameter
+    gradient was simply too small given the unnormalized input scale."""
+
+    def __init__(self, feat_dim, num_classes):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.BatchNorm1d(feat_dim),
+            nn.LayerNorm(feat_dim, eps=1e-6),
+            nn.Linear(feat_dim, num_classes, bias=False),
+        )
+        self.net.apply(_init_classifier_weights)
+
+    def forward(self, x):
+        return self.net(x)
 
 
 def _gini_impurity(pred, coe=1.0):
@@ -143,7 +183,6 @@ def main():
     parser.add_argument("--print-freq", type=int, default=50)
     parser.add_argument("--eval-freq", type=int, default=200)
 
-    parser.add_argument("--hidden-dim", type=int, default=256)
     # Adam, not SGD: a randomly-initialized small head trained on frozen features
     # has naturally small, per-parameter-uneven mean-CE gradients (confirmed via a
     # real run -- SGD at lr=0.01 left mlp_loss_x pinned at ln(num_classes) after
@@ -204,7 +243,7 @@ def main():
     teacher_now.eval()
 
     feat_dim = clip_model.text_projection.shape[1]
-    student_mlp = _MLPHead(feat_dim, args.hidden_dim, num_classes).to(device)
+    student_mlp = _ClassifierHead(feat_dim, num_classes).to(device)
     n_params = sum(p.numel() for p in student_mlp.parameters())
     print(f"student_mlp: {n_params:,} parameters")
 
