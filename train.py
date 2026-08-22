@@ -229,6 +229,20 @@ def extend_cfg(cfg, args):
         # disable it entirely.
         cfg.TRAINER.PHPLMOMENTUM.MMD_WEIGHT = 1.0
 
+        # Self-Consistency Loss (SCL, EKDA/PromptSRC-style): pulls the student's text
+        # and source-image features toward teacher_init's (pure zero-shot CLIP, never
+        # LoRA-tuned) matching features -- a regularizer against catastrophic drift
+        # away from CLIP's original representations. Decoupled from beta/teacher_init's
+        # role in pseudo-labeling (which can be ramped away quickly via BETA_POWER) --
+        # this is a separate, independent stability mechanism. No KL term on logits
+        # (EKDA also has l_scl_logits; opted out here). Text and image L1 terms share
+        # ONE weight (summed first, then scaled) rather than EKDA/PromptSRC's separate
+        # 25/10 weights. Default off; SCL_WEIGHT defaults to 1.0 (not EKDA/PromptSRC's
+        # 10-25) to stay consistent with every other loss term here defaulting to an
+        # unscaled/1.0 weight -- raise it explicitly if loss_scl needs more influence.
+        cfg.TRAINER.PHPLMOMENTUM.USE_SCL = False
+        cfg.TRAINER.PHPLMOMENTUM.SCL_WEIGHT = 1.0
+
         # CutMix between source (image_x) and target (image_u_strong), both strong-aug:
         # adds an extra loss_mix term (opt-in, default off, doesn't change existing behavior).
         cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX = False

@@ -48,6 +48,12 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
     the teachers' own predictions land on each class; DEBIAS_TAU * log(qhat) is subtracted
     from BOTH teachers' logits before fusion, to counteract systematic class bias inherited
     from CLIP's zero-shot behavior (not the true target-domain class distribution).
+  - Optional Self-Consistency Loss (cfg.TRAINER.PHPLMOMENTUM.USE_SCL, default off,
+    EKDA/PromptSRC-style): loss_scl = (L1(student_text, teacher_init_text) +
+    L1(feat_x, teacher_init_image_features)) * SCL_WEIGHT, computed on image_x --
+    regularizes the student's text/source-image features against drifting too far
+    from pure zero-shot CLIP, independent of teacher_init's (fading) role in
+    pseudo-labeling. No KL term on logits (EKDA also has one; opted out here).
   - Evaluation uses teacher_now (the adapting EMA teacher), not the student. save_model/
     load_model persist teacher_now's own LoRA snapshot directly (a separate "TeacherNow"
     checkpoint dir, alongside "Student") -- reconstructing it by re-copying student's
@@ -146,6 +152,16 @@ def _cutmix(image_a, image_b, alpha=1.0):
     return mixed, lam
 
 
+def _text_features(model):
+    """Encode the class-name prompts through `model`'s own text encoder,
+    L2-normalized -- the same computation CustomCLIP.forward does internally,
+    exposed standalone here since adding it to forward()'s return signature
+    would require touching every call site (student(), teacher_now(),
+    teacher_init(), test())."""
+    text_features = model.text_encoder(model.tokenized_prompts.to(model.logit_scale.device))
+    return text_features / text_features.norm(dim=-1, keepdim=True)
+
+
 def _lora_param_items(model):
     return [(k, v) for k, v in model.state_dict().items() if "lora_" in k]
 
@@ -191,6 +207,9 @@ class PHPLMOMENTUM(BaseDA):
             self.qhat = torch.full((self.num_classes,), 1.0 / self.num_classes, device=self.device)
 
         self.mmd_weight = cfg.TRAINER.PHPLMOMENTUM.MMD_WEIGHT
+
+        self.use_scl = cfg.TRAINER.PHPLMOMENTUM.USE_SCL
+        self.scl_weight = cfg.TRAINER.PHPLMOMENTUM.SCL_WEIGHT
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x3 (student, teacher_now, teacher_init)")
         clip_model_student = load_clip_to_cpu(cfg)
@@ -400,7 +419,22 @@ class PHPLMOMENTUM(BaseDA):
         else:
             loss_mix = torch.tensor(0.0, device=self.device)
 
-        loss = loss_x + loss_u + self.mmd_weight * loss_mmd + loss_mix
+        if self.use_scl:
+            # Self-Consistency Loss (EKDA/PromptSRC-style): pull the student's text
+            # and source-image features toward teacher_init's (pure zero-shot CLIP)
+            # matching features -- computed on image_x, mirroring EKDA's own SCL
+            # (which runs in its "train teacher" phase, also on the source batch).
+            with torch.no_grad():
+                _, zs_image_features = self.teacher_init(image_x)
+                zs_text_features = _text_features(self.teacher_init)
+            text_features = _text_features(self.student)
+            loss_scl_text = F.l1_loss(text_features, zs_text_features)
+            loss_scl_image = F.l1_loss(feat_x, zs_image_features)
+            loss_scl = (loss_scl_text + loss_scl_image) * self.scl_weight
+        else:
+            loss_scl = torch.tensor(0.0, device=self.device)
+
+        loss = loss_x + loss_u + self.mmd_weight * loss_mmd + loss_mix + loss_scl
         self.model_backward_and_update_with_gradient_monitoring(
             loss,
             names="Student",
@@ -417,6 +451,7 @@ class PHPLMOMENTUM(BaseDA):
             "loss_u": loss_u.item(),
             "loss_mmd": loss_mmd.item(),
             "loss_mix": loss_mix.item(),
+            "loss_scl": loss_scl.item(),
             "beta": beta,
             "mask_ratio": mask_ratio.item(),
             "acc_source": compute_accuracy(logits_x, label_x)[0].item(),
