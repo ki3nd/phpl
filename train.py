@@ -266,31 +266,39 @@ def extend_cfg(cfg, args):
         cfg.TRAINER.PHPLMOMENTUM.SCL_IMAGE_WEIGHT = 10.0
 
         # CMKD (Cross-Modal Knowledge Distillation, VLP-UDA-style), opt-in, default off.
-        # Adds a small learned MLP classifier on top of image features (feat_x/feat_u),
-        # separate from CLIP's own cosine-similarity classification -- since a freely
-        # learned head isn't constrained to CLIP's fixed text-embedding geometry, it can
-        # in principle fit a better decision boundary than cosine-similarity ever could,
-        # and it isn't tied to logit_scale's saturation behavior. No hard threshold: the
-        # MLP's target-domain training signal is a continuous, agreement-weighted entropy
-        # (Gini-impurity) objective against the student's own existing cosine-similarity
-        # branch (logits_u), not a hard pseudo-label -- avoids the MLP just re-learning
-        # cosine-similarity's own (possibly saturated) decision function via CE-to-a-label.
-        # teacher_now_mlp is EMA-updated from student_mlp (mirroring LoRA's teacher_now)
-        # and used ONLY for evaluation (test() logs both the existing cosine-branch
-        # accuracy and this MLP branch's, side by side) -- never trained directly.
-        # No regularization term on the cosine branch itself (VLP-UDA's own reg_loss
-        # entropy-min on their "clip" branch) -- that branch is already LoRA-adapted via
-        # the existing loss_x/loss_u/etc., an extra entropy-min pass on it wasn't found
-        # to help.
+        # A TWO-PHASE CURRICULUM, not trained jointly with LoRA from epoch 0 -- see
+        # phpl_momentum.py's class docstring for the full picture. Phase 1 (epoch <
+        # CMKD_START_EPOCH) is exactly the ordinary LoRA/EMA-teacher training, unchanged.
+        # From epoch >= CMKD_START_EPOCH (phase 2), LoRA/teacher_now/teacher_init freeze
+        # entirely, and only a small learned MLP classifier on top of image features
+        # (feat_x/feat_u) is trained against teacher_now's own (by-then converged)
+        # cosine-similarity prediction as a fixed reference -- since a freely learned
+        # head isn't constrained to CLIP's fixed text-embedding geometry or tied to
+        # logit_scale's saturation, it can in principle fit a better decision boundary.
+        # No hard threshold: the training signal is a continuous, agreement-weighted
+        # entropy (Gini-impurity) objective, not a hard pseudo-label -- avoids the MLP
+        # just re-learning cosine-similarity's own (possibly saturated) decision function.
+        # No teacher_mlp/EMA counterpart -- student_mlp is evaluated directly. No
+        # regularization term on the cosine branch itself (VLP-UDA's own reg_loss) --
+        # that branch is already frozen and done adapting by phase 2.
         cfg.TRAINER.PHPLMOMENTUM.USE_CMKD = False
         cfg.TRAINER.PHPLMOMENTUM.CMKD_HIDDEN_DIM = 256
         cfg.TRAINER.PHPLMOMENTUM.CMKD_LAMBDA1 = 1.0  # weight on the entropy-min (task+distill) terms
-        # student_mlp gets its OWN optimizer/scheduler (cfg.OPTIM cloned, LR and warmup
-        # overridden below) instead of sharing LoRA's -- LoRA's LR schedule (including
-        # OPTIM.WARMUP_CONS_LR=1e-5 during epoch 1) is tuned for gently nudging an
-        # already-good starting point (LoRA's SVD init reconstructs the pretrained
-        # weight exactly); student_mlp starts from random init and needs a much larger
-        # LR with no warmup to move anywhere meaningful in a short training budget.
+        # Epoch at which phase 2 begins -- cfg.OPTIM.MAX_EPOCH must be set higher than
+        # this (e.g. MAX_EPOCH=20, CMKD_START_EPOCH=10 for a 10+10 split) so phase 2
+        # actually gets its own dedicated epochs, not zero.
+        cfg.TRAINER.PHPLMOMENTUM.CMKD_START_EPOCH = 10
+        # DANN-style ramp gamma (2/(1+exp(-gamma*p))-1) on the entropy-min terms, over
+        # phase 2's OWN iteration count -- gamma=10 (the classic DANN value) rises fast
+        # and reaches ~1.0 well before phase 2 ends, unlike VLP-UDA's own gamma=1.0
+        # (reaches only ~0.46, tuned for their much longer ~10000-iteration budget).
+        cfg.TRAINER.PHPLMOMENTUM.CMKD_LAMB_GAMMA = 10.0
+        # student_mlp gets its OWN optimizer/scheduler (cfg.OPTIM cloned, LR/warmup/
+        # MAX_EPOCH overridden in build_model) instead of sharing LoRA's -- LoRA's LR
+        # schedule (including OPTIM.WARMUP_CONS_LR=1e-5 during epoch 1) is tuned for
+        # gently nudging an already-good starting point (LoRA's SVD init reconstructs
+        # the pretrained weight exactly); student_mlp starts from random init and needs
+        # a much larger LR with no warmup to move anywhere meaningful in a short budget.
         cfg.TRAINER.PHPLMOMENTUM.CMKD_LR = 0.01
 
         # Confidence-mask threshold strategy:
