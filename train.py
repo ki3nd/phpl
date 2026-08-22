@@ -244,6 +244,20 @@ def extend_cfg(cfg, args):
         cfg.TRAINER.PHPLMOMENTUM.SCL_TEXT_WEIGHT = 25.0
         cfg.TRAINER.PHPLMOMENTUM.SCL_IMAGE_WEIGHT = 10.0
 
+        # Confidence-mask threshold strategy:
+        #   "fixed" (default): a single CONFI for every class, every epoch (unchanged).
+        #   "flexmatch": epoch 1 (warmup) still uses the plain fixed CONFI threshold;
+        #       from epoch 2 onward, each class c gets its OWN threshold
+        #       tau_c = beta_c * CONFI, where beta_c = class_confident_count[c] /
+        #       max(class_confident_count), and class_confident_count is a running
+        #       per-class count (never reset, accumulated across all batches from
+        #       epoch 2 on) of samples whose max fused-teacher probability cleared
+        #       the FIXED CONFI threshold and were assigned class c. Classes the
+        #       model rarely predicts confidently get a lower (looser) threshold;
+        #       classes it's already confident about stay close to the full CONFI.
+        # Add new strategies as new elif branches in forward_backward, not new flags.
+        cfg.TRAINER.PHPLMOMENTUM.THRESHOLD_MODE = "fixed"
+
         # CutMix between source (image_x) and target (image_u_strong), both strong-aug:
         # adds an extra loss_mix term (opt-in, default off, doesn't change existing behavior).
         cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX = False

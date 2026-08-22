@@ -32,6 +32,14 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
         batch's loss_u is scaled by mask_ratio (the fraction of the batch that clears
         CONFI), so confidence still gates how much loss_u matters but never zeroes it
         out just because no single sample individually clears CONFI. Opt-in only.
+  - The confidence mask itself follows cfg.TRAINER.PHPLMOMENTUM.THRESHOLD_MODE:
+      "fixed" (default): a single CONFI for every class, every epoch (unchanged).
+      "flexmatch": from epoch 2 onward, each class gets its own threshold
+        tau_c = beta_c*CONFI, where beta_c is that class's share of a running,
+        never-reset count of samples confidently (>= the fixed CONFI) assigned to
+        it -- FlexMatch-style Curriculum Pseudo Labeling. Epoch 1 (warmup) always
+        uses the plain fixed threshold regardless of this setting. New threshold
+        strategies should be added as new modes here, not new boolean flags.
   - Student sees strong-augmented target/source images; the teacher sees a weak-augmented
     target view (asymmetric-view self-training, reduces confirmation bias) -- but only if
     cfg.TRAINER.PHPLMOMENTUM.USE_STRONG_AUG is set True. Default (False) is no weak/strong
@@ -212,6 +220,14 @@ class PHPLMOMENTUM(BaseDA):
         self.scl_text_weight = cfg.TRAINER.PHPLMOMENTUM.SCL_TEXT_WEIGHT
         self.scl_image_weight = cfg.TRAINER.PHPLMOMENTUM.SCL_IMAGE_WEIGHT
 
+        self.threshold_mode = cfg.TRAINER.PHPLMOMENTUM.THRESHOLD_MODE
+        if self.threshold_mode not in ("fixed", "flexmatch"):
+            raise ValueError(f"Unknown TRAINER.PHPLMOMENTUM.THRESHOLD_MODE: {self.threshold_mode!r} (expected 'fixed' or 'flexmatch')")
+        if self.threshold_mode == "flexmatch":
+            # Running per-class confident-prediction count, never reset -- see
+            # train.py's THRESHOLD_MODE comment.
+            self.class_confident_count = torch.zeros(self.num_classes, device=self.device)
+
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x3 (student, teacher_now, teacher_init)")
         clip_model_student = load_clip_to_cpu(cfg)
         clip_model_teacher_now = load_clip_to_cpu(cfg)
@@ -386,7 +402,24 @@ class PHPLMOMENTUM(BaseDA):
             logits_fusion = beta * logits_teacher_now + (1 - beta) * logits_teacher_init
             prob_fusion = F.softmax(logits_fusion, dim=-1)
             max_probs, pseudo_label = torch.max(prob_fusion, dim=-1)
-            mask = max_probs.ge(self.confi).float()
+
+            # Samples confidently (>= the FIXED CONFI) predicted as each class --
+            # used both for the plain fixed-threshold mask below and, in "flexmatch"
+            # mode, to update class_confident_count.
+            confident = max_probs.ge(self.confi).float()
+
+            if self.threshold_mode == "flexmatch" and self.epoch >= 1:
+                # Epoch 1 (warmup) always uses the plain fixed threshold, same as
+                # "fixed" mode -- FlexMatch's per-class thresholds only kick in from
+                # epoch 2, once class_confident_count has had a chance to accumulate.
+                count_max = self.class_confident_count.max().clamp(min=1.0)
+                beta_c = self.class_confident_count / count_max
+                tau_c = beta_c * self.confi
+                mask = max_probs.ge(tau_c[pseudo_label]).float()
+                self.class_confident_count.scatter_add_(0, pseudo_label, confident)
+            else:
+                mask = confident
+
             mask_ratio = mask.mean()
 
         logits_u, feat_u = self.student(image_u_strong)
