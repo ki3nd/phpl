@@ -49,8 +49,8 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
     from BOTH teachers' logits before fusion, to counteract systematic class bias inherited
     from CLIP's zero-shot behavior (not the true target-domain class distribution).
   - Optional Self-Consistency Loss (cfg.TRAINER.PHPLMOMENTUM.USE_SCL, default off,
-    EKDA/PromptSRC-style): loss_scl = (L1(student_text, teacher_init_text) +
-    L1(feat_x, teacher_init_image_features)) * SCL_WEIGHT, computed on image_x --
+    EKDA/PromptSRC-style): loss_scl = L1(student_text, teacher_init_text)*SCL_TEXT_WEIGHT +
+    L1(feat_x, teacher_init_image_features)*SCL_IMAGE_WEIGHT, computed on image_x --
     regularizes the student's text/source-image features against drifting too far
     from pure zero-shot CLIP, independent of teacher_init's (fading) role in
     pseudo-labeling. No KL term on logits (EKDA also has one; opted out here).
@@ -209,7 +209,8 @@ class PHPLMOMENTUM(BaseDA):
         self.mmd_weight = cfg.TRAINER.PHPLMOMENTUM.MMD_WEIGHT
 
         self.use_scl = cfg.TRAINER.PHPLMOMENTUM.USE_SCL
-        self.scl_weight = cfg.TRAINER.PHPLMOMENTUM.SCL_WEIGHT
+        self.scl_text_weight = cfg.TRAINER.PHPLMOMENTUM.SCL_TEXT_WEIGHT
+        self.scl_image_weight = cfg.TRAINER.PHPLMOMENTUM.SCL_IMAGE_WEIGHT
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x3 (student, teacher_now, teacher_init)")
         clip_model_student = load_clip_to_cpu(cfg)
@@ -428,10 +429,16 @@ class PHPLMOMENTUM(BaseDA):
                 _, zs_image_features = self.teacher_init(image_x)
                 zs_text_features = _text_features(self.teacher_init)
             text_features = _text_features(self.student)
-            loss_scl_text = F.l1_loss(text_features, zs_text_features)
-            loss_scl_image = F.l1_loss(feat_x, zs_image_features)
-            loss_scl = (loss_scl_text + loss_scl_image) * self.scl_weight
+            # Raw (unweighted) values logged separately below -- SCL_TEXT_WEIGHT/
+            # SCL_IMAGE_WEIGHT are EKDA/PromptSRC's own values, not verified to be
+            # well-calibrated for LoRA; check these against loss_x/loss_u's scale
+            # before trusting the weighted loss_scl.
+            loss_scl_text_raw = F.l1_loss(text_features, zs_text_features)
+            loss_scl_image_raw = F.l1_loss(feat_x, zs_image_features)
+            loss_scl = loss_scl_text_raw * self.scl_text_weight + loss_scl_image_raw * self.scl_image_weight
         else:
+            loss_scl_text_raw = torch.tensor(0.0, device=self.device)
+            loss_scl_image_raw = torch.tensor(0.0, device=self.device)
             loss_scl = torch.tensor(0.0, device=self.device)
 
         loss = loss_x + loss_u + self.mmd_weight * loss_mmd + loss_mix + loss_scl
@@ -452,6 +459,8 @@ class PHPLMOMENTUM(BaseDA):
             "loss_mmd": loss_mmd.item(),
             "loss_mix": loss_mix.item(),
             "loss_scl": loss_scl.item(),
+            "loss_scl_text_raw": loss_scl_text_raw.item(),
+            "loss_scl_image_raw": loss_scl_image_raw.item(),
             "beta": beta,
             "mask_ratio": mask_ratio.item(),
             "acc_source": compute_accuracy(logits_x, label_x)[0].item(),

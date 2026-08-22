@@ -235,13 +235,14 @@ def extend_cfg(cfg, args):
         # away from CLIP's original representations. Decoupled from beta/teacher_init's
         # role in pseudo-labeling (which can be ramped away quickly via BETA_POWER) --
         # this is a separate, independent stability mechanism. No KL term on logits
-        # (EKDA also has l_scl_logits; opted out here). Text and image L1 terms share
-        # ONE weight (summed first, then scaled) rather than EKDA/PromptSRC's separate
-        # 25/10 weights. Default off; SCL_WEIGHT defaults to 1.0 (not EKDA/PromptSRC's
-        # 10-25) to stay consistent with every other loss term here defaulting to an
-        # unscaled/1.0 weight -- raise it explicitly if loss_scl needs more influence.
+        # (EKDA also has l_scl_logits; opted out here). Text and image L1 terms have
+        # SEPARATE weights, same as EKDA/PromptSRC's own values -- NOT verified to be
+        # well-calibrated for LoRA (tuned for prompt-tuning instead, which shifts
+        # features by a different order of magnitude); log the raw unweighted values
+        # before trusting these. Default off.
         cfg.TRAINER.PHPLMOMENTUM.USE_SCL = False
-        cfg.TRAINER.PHPLMOMENTUM.SCL_WEIGHT = 1.0
+        cfg.TRAINER.PHPLMOMENTUM.SCL_TEXT_WEIGHT = 25.0
+        cfg.TRAINER.PHPLMOMENTUM.SCL_IMAGE_WEIGHT = 10.0
 
         # CutMix between source (image_x) and target (image_u_strong), both strong-aug:
         # adds an extra loss_mix term (opt-in, default off, doesn't change existing behavior).
