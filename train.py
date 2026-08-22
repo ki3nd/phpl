@@ -250,13 +250,26 @@ def extend_cfg(cfg, args):
         #       from epoch 2 onward, each class c gets its OWN threshold
         #       tau_c = beta_c * CONFI, where beta_c = class_confident_count[c] /
         #       max(class_confident_count), and class_confident_count is a running
-        #       per-class count (never reset, accumulated across all batches from
-        #       epoch 2 on) of samples whose max fused-teacher probability cleared
-        #       the FIXED CONFI threshold and were assigned class c. Classes the
+        #       per-class count (never reset) of samples whose max fused-teacher
+        #       probability cleared the FIXED CONFI threshold and were assigned
+        #       class c -- accumulated starting from epoch 1 (even though epoch 1's
+        #       mask itself still uses the fixed threshold), so epoch 2 doesn't
+        #       start every class's tau_c at 0 (an all-pass cold start). Classes the
         #       model rarely predicts confidently get a lower (looser) threshold;
         #       classes it's already confident about stay close to the full CONFI.
         # Add new strategies as new elif branches in forward_backward, not new flags.
         cfg.TRAINER.PHPLMOMENTUM.THRESHOLD_MODE = "fixed"
+
+        # "flexmatch" mode only: how beta_c maps to a threshold multiplier.
+        #   "linear" (default, unchanged): tau_c = beta_c * CONFI.
+        #   "convex": tau_c = (beta_c / (2 - beta_c)) * CONFI -- FlexMatch's OWN mapping
+        #       function M(beta) = beta/(2-beta). Since beta_c in [0,1], M(beta_c) >=
+        #       beta_c always (equal only at the endpoints 0 and 1), so tau_c rises
+        #       FASTER than linear as soon as a class has any confident evidence at
+        #       all -- shortens the "everything passes" window right after a class's
+        #       count leaves 0, at the cost of a steeper threshold later for classes
+        #       still catching up.
+        cfg.TRAINER.PHPLMOMENTUM.FLEXMATCH_MAPPING = "linear"
 
         # CutMix between source (image_x) and target (image_u_strong), both strong-aug:
         # adds an extra loss_mix term (opt-in, default off, doesn't change existing behavior).

@@ -37,9 +37,13 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
       "flexmatch": from epoch 2 onward, each class gets its own threshold
         tau_c = beta_c*CONFI, where beta_c is that class's share of a running,
         never-reset count of samples confidently (>= the fixed CONFI) assigned to
-        it -- FlexMatch-style Curriculum Pseudo Labeling. Epoch 1 (warmup) always
-        uses the plain fixed threshold regardless of this setting. New threshold
-        strategies should be added as new modes here, not new boolean flags.
+        it -- FlexMatch-style Curriculum Pseudo Labeling. This count starts
+        accumulating from epoch 1 (even though epoch 1's mask always uses the
+        plain fixed threshold), so epoch 2 doesn't start every class's tau_c at 0.
+        cfg.TRAINER.PHPLMOMENTUM.FLEXMATCH_MAPPING picks how beta_c maps to tau_c:
+        "linear" (default, tau_c = beta_c*CONFI) or "convex" (FlexMatch's own
+        M(beta)=beta/(2-beta), rising faster than linear once any evidence exists).
+        New threshold strategies should be added as new modes here, not new flags.
   - Student sees strong-augmented target/source images; the teacher sees a weak-augmented
     target view (asymmetric-view self-training, reduces confirmation bias) -- but only if
     cfg.TRAINER.PHPLMOMENTUM.USE_STRONG_AUG is set True. Default (False) is no weak/strong
@@ -227,6 +231,11 @@ class PHPLMOMENTUM(BaseDA):
             # Running per-class confident-prediction count, never reset -- see
             # train.py's THRESHOLD_MODE comment.
             self.class_confident_count = torch.zeros(self.num_classes, device=self.device)
+            self.flexmatch_mapping = cfg.TRAINER.PHPLMOMENTUM.FLEXMATCH_MAPPING
+            if self.flexmatch_mapping not in ("linear", "convex"):
+                raise ValueError(
+                    f"Unknown TRAINER.PHPLMOMENTUM.FLEXMATCH_MAPPING: {self.flexmatch_mapping!r} (expected 'linear' or 'convex')"
+                )
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x3 (student, teacher_now, teacher_init)")
         clip_model_student = load_clip_to_cpu(cfg)
@@ -408,15 +417,28 @@ class PHPLMOMENTUM(BaseDA):
             # mode, to update class_confident_count.
             confident = max_probs.ge(self.confi).float()
 
+            if self.threshold_mode == "flexmatch":
+                # Accumulate class_confident_count from epoch 1 onward (even though
+                # epoch 1's mask below still uses the plain fixed threshold) so epoch
+                # 2 doesn't start from an all-zero cold start -- warm-starting this
+                # way means tau_c isn't 0 for every class the moment epoch 2 begins,
+                # cutting down the noisy "everything passes" window FlexMatch would
+                # otherwise have right after the per-class thresholds switch on.
+                self.class_confident_count.scatter_add_(0, pseudo_label, confident)
+
             if self.threshold_mode == "flexmatch" and self.epoch >= 1:
                 # Epoch 1 (warmup) always uses the plain fixed threshold, same as
                 # "fixed" mode -- FlexMatch's per-class thresholds only kick in from
-                # epoch 2, once class_confident_count has had a chance to accumulate.
+                # epoch 2.
                 count_max = self.class_confident_count.max().clamp(min=1.0)
                 beta_c = self.class_confident_count / count_max
+                if self.flexmatch_mapping == "convex":
+                    # FlexMatch's own M(beta) = beta/(2-beta) -- >= beta_c everywhere
+                    # except at the 0/1 endpoints, so tau_c rises faster than linear
+                    # as soon as a class has ANY confident evidence.
+                    beta_c = beta_c / (2.0 - beta_c)
                 tau_c = beta_c * self.confi
                 mask = max_probs.ge(tau_c[pseudo_label]).float()
-                self.class_confident_count.scatter_add_(0, pseudo_label, confident)
             else:
                 mask = confident
 
