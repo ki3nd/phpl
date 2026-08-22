@@ -43,6 +43,16 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
         cfg.TRAINER.PHPLMOMENTUM.FLEXMATCH_MAPPING picks how beta_c maps to tau_c:
         "linear" (default, tau_c = beta_c*CONFI) or "convex" (FlexMatch's own
         M(beta)=beta/(2-beta), rising faster than linear once any evidence exists).
+      "flexmatch_v2": faithful to the actual FlexMatch paper (Zhang et al., NeurIPS
+        2021) -- unlike "flexmatch" above, which is a simplified approximation.
+        Keeps one slot per unlabeled sample (self.selected_label, size =
+        len(train_u)), OVERWRITTEN (not accumulated) with that sample's current
+        pseudo-label whenever confidence clears the fixed CONFI, so a sample
+        revisited across many epochs is only ever counted once, at its most recent
+        assignment -- fixes "flexmatch"'s tendency for tau_c to drift upward forever
+        with epoch count. sigma(c) = count of slots == c; beta_c = sigma(c) /
+        max(max_c sigma(c), N - sum(sigma)) -- the paper's own warm-up term, active
+        from iteration 1 (no separate epoch-1 gate needed).
         New threshold strategies should be added as new modes here, not new flags.
   - Student sees strong-augmented target/source images; the teacher sees a weak-augmented
     target view (asymmetric-view self-training, reduces confirmation bias) -- but only if
@@ -225,17 +235,26 @@ class PHPLMOMENTUM(BaseDA):
         self.scl_image_weight = cfg.TRAINER.PHPLMOMENTUM.SCL_IMAGE_WEIGHT
 
         self.threshold_mode = cfg.TRAINER.PHPLMOMENTUM.THRESHOLD_MODE
-        if self.threshold_mode not in ("fixed", "flexmatch"):
-            raise ValueError(f"Unknown TRAINER.PHPLMOMENTUM.THRESHOLD_MODE: {self.threshold_mode!r} (expected 'fixed' or 'flexmatch')")
+        if self.threshold_mode not in ("fixed", "flexmatch", "flexmatch_v2"):
+            raise ValueError(
+                f"Unknown TRAINER.PHPLMOMENTUM.THRESHOLD_MODE: {self.threshold_mode!r} "
+                "(expected 'fixed', 'flexmatch', or 'flexmatch_v2')"
+            )
         if self.threshold_mode == "flexmatch":
             # Running per-class confident-prediction count, never reset -- see
             # train.py's THRESHOLD_MODE comment.
             self.class_confident_count = torch.zeros(self.num_classes, device=self.device)
+        if self.threshold_mode in ("flexmatch", "flexmatch_v2"):
             self.flexmatch_mapping = cfg.TRAINER.PHPLMOMENTUM.FLEXMATCH_MAPPING
             if self.flexmatch_mapping not in ("linear", "convex"):
                 raise ValueError(
                     f"Unknown TRAINER.PHPLMOMENTUM.FLEXMATCH_MAPPING: {self.flexmatch_mapping!r} (expected 'linear' or 'convex')"
                 )
+        if self.threshold_mode == "flexmatch_v2":
+            # One slot per unlabeled sample, -1 = never confidently assigned yet --
+            # see train.py's THRESHOLD_MODE comment for the exact FlexMatch formula.
+            num_unlabeled = len(self.dm.dataset.train_u)
+            self.selected_label = torch.full((num_unlabeled,), -1, dtype=torch.long, device=self.device)
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x3 (student, teacher_now, teacher_init)")
         clip_model_student = load_clip_to_cpu(cfg)
@@ -365,10 +384,13 @@ class PHPLMOMENTUM(BaseDA):
             # see the exact same single augmented draw, matching PHPL exactly.
             image_u_weak = image_u_strong
         label_u = batch_u["label"].to(self.device)
-        return image_x, label_x, image_u_strong, image_u_weak, label_u
+        # Per-sample dataset index -- only used by THRESHOLD_MODE "flexmatch_v2"'s
+        # per-sample selected_label slots (Dassl's DatasetWrapper always includes it).
+        index_u = batch_u["index"].to(self.device)
+        return image_x, label_x, image_u_strong, image_u_weak, label_u, index_u
 
     def forward_backward(self, batch_x, batch_u):
-        image_x, label_x, image_u_strong, image_u_weak, label_u = self.parse_batch_train(batch_x, batch_u)
+        image_x, label_x, image_u_strong, image_u_weak, label_u, index_u = self.parse_batch_train(batch_x, batch_u)
 
         self.student.train()
         # teacher_now is a _FrozenTeacherCLIP -- its train() unconditionally
@@ -443,6 +465,30 @@ class PHPLMOMENTUM(BaseDA):
                 if (self.batch_idx + 1) % 10 == 0:
                     tau_list = ", ".join(f"{v:.3f}" for v in tau_c.tolist())
                     print(f"[flexmatch tau_c] epoch {self.epoch + 1} batch {self.batch_idx + 1}: [{tau_list}]")
+            elif self.threshold_mode == "flexmatch_v2":
+                # Overwrite (not accumulate) each confidently-predicted sample's own
+                # slot with its current pseudo-label -- a sample revisited across many
+                # epochs only ever counts once, at its most recent assignment.
+                confident_bool = confident.bool()
+                self.selected_label[index_u[confident_bool]] = pseudo_label[confident_bool]
+
+                sigma = torch.bincount(
+                    self.selected_label[self.selected_label >= 0], minlength=self.num_classes
+                ).float()
+                n_unused = (self.selected_label < 0).sum().float()
+                # Paper's own warm-up (Eq. 11): while most samples are still
+                # unassigned, N-sum(sigma) dominates the denominator, keeping every
+                # beta_c small instead of one class spiking to 1 from a few early hits.
+                denom = torch.maximum(sigma.max(), n_unused).clamp(min=1.0)
+                beta_c = sigma / denom
+                if self.flexmatch_mapping == "convex":
+                    beta_c = beta_c / (2.0 - beta_c)
+                tau_c = beta_c * self.confi
+                mask = max_probs.ge(tau_c[pseudo_label]).float()
+
+                if (self.batch_idx + 1) % 10 == 0:
+                    tau_list = ", ".join(f"{v:.3f}" for v in tau_c.tolist())
+                    print(f"[flexmatch_v2 tau_c] epoch {self.epoch + 1} batch {self.batch_idx + 1}: [{tau_list}]")
             else:
                 mask = confident
 

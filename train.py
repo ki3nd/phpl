@@ -257,6 +257,20 @@ def extend_cfg(cfg, args):
         #       start every class's tau_c at 0 (an all-pass cold start). Classes the
         #       model rarely predicts confidently get a lower (looser) threshold;
         #       classes it's already confident about stay close to the full CONFI.
+        #   "flexmatch_v2": faithful to the actual FlexMatch paper (Zhang et al.,
+        #       NeurIPS 2021), unlike the "flexmatch" mode above. Keeps ONE slot per
+        #       unlabeled sample (self.selected_label, size = len(train_u), init -1),
+        #       OVERWRITTEN (not accumulated) with that sample's current pseudo-label
+        #       whenever its confidence clears the fixed CONFI -- so a sample revisited
+        #       across many epochs is only ever counted once, at its most recent
+        #       assignment, instead of "flexmatch"'s ever-growing per-class sum.
+        #       sigma(c) = count of slots currently == c; beta_c = sigma(c) /
+        #       max(max_c sigma(c), N - sum(sigma)) -- the paper's own warm-up: while
+        #       most samples are still unassigned (-1), N-sum(sigma) dominates the
+        #       denominator, keeping every beta_c small instead of letting one class
+        #       spike to 1 just because it happens to have a few early confident hits.
+        #       No separate epoch-1 warmup needed -- this formula's warm-up applies
+        #       from iteration 1.
         # Add new strategies as new elif branches in forward_backward, not new flags.
         cfg.TRAINER.PHPLMOMENTUM.THRESHOLD_MODE = "fixed"
 
