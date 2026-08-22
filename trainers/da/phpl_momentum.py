@@ -523,6 +523,7 @@ class PHPLMOMENTUM(BaseDA):
             # forward_backward) now covers student_mlp's params too when its name is
             # included there.
             mlp_optim_cfg = cfg.OPTIM.clone()
+            mlp_optim_cfg.defrost()
             mlp_optim_cfg.LR = cfg.TRAINER.PHPLMOMENTUM.CMKD_LR
             mlp_optim_cfg.WARMUP_EPOCH = 0
             self.mlp_optim = build_optimizer(self.student_mlp, mlp_optim_cfg)
