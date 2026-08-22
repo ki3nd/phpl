@@ -309,6 +309,13 @@ def extend_cfg(cfg, args):
         # the pretrained weight exactly); student_mlp starts from random init and needs
         # a much larger LR with no warmup to move anywhere meaningful in a short budget.
         cfg.TRAINER.PHPLMOMENTUM.CMKD_LR = 0.01
+        # Phase 2's "epoch" length in ITERATIONS, decoupled from the real dataset's
+        # per-epoch length -- VLP-UDA-style (their own n_iter_per_epoch=500,
+        # n_epoch=20), instead of run_epoch()'s usual num_batches = min(len_x, len_u).
+        # Total phase-2 iterations = OPTIM.MAX_EPOCH * CMKD_ITERS_PER_EPOCH; the
+        # loaders cycle (re-iter on StopIteration, already handled by run_epoch())
+        # rather than being tied to how many batches actually fit in the dataset.
+        cfg.TRAINER.PHPLMOMENTUM.CMKD_ITERS_PER_EPOCH = 500
 
         # Confidence-mask threshold strategy:
         #   "fixed" (default): a single CONFI for every class, every epoch (unchanged).

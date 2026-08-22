@@ -501,10 +501,13 @@ class PHPLMOMENTUM(BaseDA):
             self.cmkd_lambda1 = cfg.TRAINER.PHPLMOMENTUM.CMKD_LAMBDA1
             self.cmkd_lamb_gamma = cfg.TRAINER.PHPLMOMENTUM.CMKD_LAMB_GAMMA
             self.cmkd_start_epoch = cfg.TRAINER.PHPLMOMENTUM.CMKD_START_EPOCH
+            # Phase 2's own "epoch" length in iterations, decoupled from the real
+            # dataset length -- see run_epoch() override below.
+            self.cmkd_iters_per_epoch = cfg.TRAINER.PHPLMOMENTUM.CMKD_ITERS_PER_EPOCH
             self.cmkd_iter = 0
             # lamb ramps over phase 2's OWN iteration budget, not the whole run --
             # phase 1 (epoch < cmkd_start_epoch) never touches cmkd_iter.
-            self.cmkd_max_iter = max((self.max_epoch - self.cmkd_start_epoch) * self.num_batches, 1)
+            self.cmkd_max_iter = max((self.max_epoch - self.cmkd_start_epoch) * self.cmkd_iters_per_epoch, 1)
 
         self.optim = build_optimizer(self.student, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
@@ -573,6 +576,77 @@ class PHPLMOMENTUM(BaseDA):
     def before_epoch(self):
         if self.threshold_mode == "cbst":
             self._update_cbst_thresholds()
+
+    def run_epoch(self):
+        if self.use_cmkd and self.epoch >= self.cmkd_start_epoch:
+            self._run_epoch_cmkd()
+        else:
+            super().run_epoch()
+
+    def _run_epoch_cmkd(self):
+        """Same loop as BaseDA.run_epoch() (trainers/baseda.py), except
+        self.num_batches is a FIXED iteration count (CMKD_ITERS_PER_EPOCH),
+        decoupled from the real dataset length -- VLP-UDA-style (their own
+        n_iter_per_epoch=500). The train_x/train_u loaders already cycle
+        (re-iter on StopIteration) regardless of which loop drives them."""
+        self.set_model_mode("train")
+        losses = MetricMeter()
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+
+        self.num_batches = self.cmkd_iters_per_epoch
+
+        train_loader_x_iter = iter(self.train_loader_x)
+        train_loader_u_iter = iter(self.train_loader_u)
+
+        end = time.time()
+        for self.batch_idx in range(self.num_batches):
+            try:
+                batch_x = next(train_loader_x_iter)
+            except StopIteration:
+                train_loader_x_iter = iter(self.train_loader_x)
+                batch_x = next(train_loader_x_iter)
+
+            try:
+                batch_u = next(train_loader_u_iter)
+            except StopIteration:
+                train_loader_u_iter = iter(self.train_loader_u)
+                batch_u = next(train_loader_u_iter)
+
+            data_time.update(time.time() - end)
+            loss_summary = self.forward_backward(batch_x, batch_u)
+            batch_time.update(time.time() - end)
+            losses.update(loss_summary)
+
+            if (self.batch_idx + 1) % self.cfg.TRAIN.PRINT_FREQ == 0 \
+                or self.num_batches < self.cfg.TRAIN.PRINT_FREQ:
+                nb_remain = self.num_batches - self.batch_idx - 1
+                nb_remain += (self.max_epoch - self.epoch - 1) * self.num_batches
+                eta_seconds = batch_time.avg * nb_remain
+                eta = str(datetime.timedelta(seconds=int(eta_seconds)))
+                print("epoch [{0}/{1}][{2}/{3}]\t"
+                      "time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
+                      "data {data_time.val:.3f} ({data_time.avg:.3f})\t"
+                      "eta {eta}\t"
+                      "{losses}\t"
+                      "lr {lr:.6e}".format(
+                          self.epoch + 1,
+                          self.max_epoch,
+                          self.batch_idx + 1,
+                          self.num_batches,
+                          batch_time=batch_time,
+                          data_time=data_time,
+                          eta=eta,
+                          losses=losses,
+                          lr=self.get_current_lr("StudentMLP"),
+                      ))
+
+            n_iter = self.epoch * self.num_batches + self.batch_idx
+            for name, meter in losses.meters.items():
+                self.write_scalar("train/" + name, meter.avg, n_iter)
+            self.write_scalar("train/lr", self.get_current_lr("StudentMLP"), n_iter)
+
+            end = time.time()
 
     @torch.no_grad()
     def _update_cbst_thresholds(self):
