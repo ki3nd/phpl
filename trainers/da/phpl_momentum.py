@@ -260,13 +260,13 @@ def _gini_impurity(pred, coe=1.0):
     (a softmax distribution), normalized per-class by that class's total mass in
     the batch (sum_dim) to avoid the degenerate "always predict the majority
     class" failure mode plain entropy minimization is prone to. `coe` is a
-    per-sample weight (e.g. agreement with another branch). Averaged over the
-    batch (not summed, unlike VLP-UDA's own formula) so it stays on the same
-    per-sample scale as mlp_loss_x's mean-reduced CE -- summing let this term's
-    gradient (scaling with batch_size) drown out CE's under plain SGD, and
-    mlp_loss_x/acc_source_mlp never moved off random-init levels as a result."""
+    per-sample weight (e.g. agreement with another branch). Summed (not averaged)
+    over the batch, matching VLP-UDA's own formula exactly -- this DOES put it on
+    a different scale than mlp_loss_x's mean-reduced CE (confirmed to drown out
+    CE's gradient under plain SGD at CMKD_LAMBDA1=1.0), so CMKD_LAMBDA1 defaults
+    to VLP-UDA's own value (0.25, not 1.0) to compensate -- see train.py."""
     sum_dim = pred.sum(dim=0, keepdim=True).detach().clamp(min=1e-8)
-    return torch.mean(coe * (1 - torch.sum(pred ** 2 / sum_dim, dim=-1)))
+    return torch.sum(coe * (1 - torch.sum(pred ** 2 / sum_dim, dim=-1)))
 
 
 def _calibrated_coefficient(pred, pred_reference):
@@ -522,18 +522,22 @@ class PHPLMOMENTUM(BaseDA):
         self.register_model("TeacherInit", self.teacher_init, None, None)
 
         if self.use_cmkd:
-            # student_mlp gets its OWN optimizer/scheduler, cloned from cfg.OPTIM but
-            # with a different LR, no warmup, and MAX_EPOCH shrunk to phase 2's own
-            # duration -- its scheduler is only ever .step()'d during phase 2 (see
-            # forward_backward/update_lr), so the cosine curve should span exactly
-            # that window, not the whole (phase 1 + phase 2) run.
+            # student_mlp gets its OWN optimizer, cloned from cfg.OPTIM but with a
+            # different LR -- LoRA's LR is tuned for gently nudging an already-good
+            # starting point, not a randomly-initialized head.
             mlp_optim_cfg = cfg.OPTIM.clone()
             mlp_optim_cfg.defrost()
             mlp_optim_cfg.LR = cfg.TRAINER.PHPLMOMENTUM.CMKD_LR
-            mlp_optim_cfg.WARMUP_EPOCH = 0
-            mlp_optim_cfg.MAX_EPOCH = max(self.max_epoch - cfg.TRAINER.PHPLMOMENTUM.CMKD_START_EPOCH, 1)
             self.mlp_optim = build_optimizer(self.student_mlp, mlp_optim_cfg)
-            self.mlp_sched = build_lr_scheduler(self.mlp_optim, mlp_optim_cfg)
+            # NOT Dassl's build_lr_scheduler (epoch-granularity, cosine-shaped) --
+            # VLP-UDA's own decay shape instead, stepped every ITERATION (see
+            # _forward_backward_cmkd), matching main.py's scheduler.step() placement
+            # inside their training loop rather than once per epoch.
+            lr_gamma = cfg.TRAINER.PHPLMOMENTUM.CMKD_LR_GAMMA
+            lr_decay = cfg.TRAINER.PHPLMOMENTUM.CMKD_LR_DECAY
+            self.mlp_sched = torch.optim.lr_scheduler.LambdaLR(
+                self.mlp_optim, lr_lambda=lambda step: (1.0 + lr_gamma * step) ** (-lr_decay)
+            )
             self.register_model("StudentMLP", self.student_mlp, self.mlp_optim, self.mlp_sched)
 
         self.t_sne_path = osp.join(self.output_dir, "tsne")
@@ -967,6 +971,10 @@ class PHPLMOMENTUM(BaseDA):
             monitor_interval=10,
             clip_on_explosion=True,
         )
+        # Every iteration, like lamb (self.cmkd_iter above) and VLP-UDA's own
+        # scheduler.step() placement (main.py, inside the training loop) --
+        # NOT once per epoch via the usual update_lr() call.
+        self.mlp_sched.step()
 
         loss_summary = {
             "loss_cmkd": loss_cmkd.item(),
@@ -977,9 +985,6 @@ class PHPLMOMENTUM(BaseDA):
             "acc_source_mlp": compute_accuracy(mlp_logits_x, label_x)[0].item(),
             "acc_target_mlp": compute_accuracy(mlp_logits_u, label_u)[0].item(),
         }
-
-        if (self.batch_idx + 1) == self.num_batches:
-            self.update_lr(names="StudentMLP")
 
         return loss_summary
 

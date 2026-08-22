@@ -292,7 +292,11 @@ def extend_cfg(cfg, args):
         # that branch is already frozen and done adapting by phase 2.
         cfg.TRAINER.PHPLMOMENTUM.USE_CMKD = False
         cfg.TRAINER.PHPLMOMENTUM.CMKD_HIDDEN_DIM = 256
-        cfg.TRAINER.PHPLMOMENTUM.CMKD_LAMBDA1 = 1.0  # weight on the entropy-min (task+distill) terms
+        # VLP-UDA's own value (office_home.yaml's lambda1) -- _gini_impurity sums
+        # (not averages) over the batch, so this needs to stay small relative to
+        # mlp_loss_x's mean-reduced CE, not 1.0 (confirmed via a real training log
+        # to otherwise drown out the CE gradient under plain SGD).
+        cfg.TRAINER.PHPLMOMENTUM.CMKD_LAMBDA1 = 0.25
         # Epoch at which phase 2 begins -- cfg.OPTIM.MAX_EPOCH must be set higher than
         # this (e.g. MAX_EPOCH=20, CMKD_START_EPOCH=10 for a 10+10 split) so phase 2
         # actually gets its own dedicated epochs, not zero.
@@ -309,6 +313,17 @@ def extend_cfg(cfg, args):
         # the pretrained weight exactly); student_mlp starts from random init and needs
         # a much larger LR with no warmup to move anywhere meaningful in a short budget.
         cfg.TRAINER.PHPLMOMENTUM.CMKD_LR = 0.01
+        # student_mlp's LR decay -- VLP-UDA's own shape (main.py's optimizer
+        # scheduler: lr_lambda(step) = (1 + gamma*step)^(-decay)), stepped every
+        # ITERATION (not once per epoch -- see _forward_backward_cmkd), via a plain
+        # torch LambdaLR built directly in build_model (not Dassl's build_lr_scheduler,
+        # which is epoch-granularity and cosine-shaped). NOT multiplying this by
+        # CMKD_LR again inside the lambda -- LambdaLR already does base_lr * lambda(x),
+        # so doing that too would square the LR (VLP-UDA's own code does exactly this,
+        # apparently unintentionally: their optimizer's base LR is already args.lr, and
+        # their lambda ALSO multiplies by args.lr).
+        cfg.TRAINER.PHPLMOMENTUM.CMKD_LR_GAMMA = 0.0003
+        cfg.TRAINER.PHPLMOMENTUM.CMKD_LR_DECAY = 0.75
         # Phase 2's "epoch" length in ITERATIONS, decoupled from the real dataset's
         # per-epoch length -- VLP-UDA-style (their own n_iter_per_epoch=500,
         # n_epoch=20), instead of run_epoch()'s usual num_batches = min(len_x, len_u).
