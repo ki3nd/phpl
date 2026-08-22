@@ -285,6 +285,13 @@ def extend_cfg(cfg, args):
         cfg.TRAINER.PHPLMOMENTUM.USE_CMKD = False
         cfg.TRAINER.PHPLMOMENTUM.CMKD_HIDDEN_DIM = 256
         cfg.TRAINER.PHPLMOMENTUM.CMKD_LAMBDA1 = 1.0  # weight on the entropy-min (task+distill) terms
+        # student_mlp gets its OWN optimizer/scheduler (cfg.OPTIM cloned, LR and warmup
+        # overridden below) instead of sharing LoRA's -- LoRA's LR schedule (including
+        # OPTIM.WARMUP_CONS_LR=1e-5 during epoch 1) is tuned for gently nudging an
+        # already-good starting point (LoRA's SVD init reconstructs the pretrained
+        # weight exactly); student_mlp starts from random init and needs a much larger
+        # LR with no warmup to move anywhere meaningful in a short training budget.
+        cfg.TRAINER.PHPLMOMENTUM.CMKD_LR = 0.01
 
         # Confidence-mask threshold strategy:
         #   "fixed" (default): a single CONFI for every class, every epoch (unchanged).

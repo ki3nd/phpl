@@ -506,16 +506,28 @@ class PHPLMOMENTUM(BaseDA):
             self.cmkd_iter = 0
             self.cmkd_max_iter = max(self.max_epoch * self.num_batches, 1)
 
-        # student_mlp's params need to share the SAME optimizer as student's LoRA
-        # params (a single combined module, when CMKD is on) so both get updated.
-        optim_target = nn.ModuleList([self.student, self.student_mlp]) if self.use_cmkd else self.student
-        self.optim = build_optimizer(optim_target, cfg.OPTIM)
+        self.optim = build_optimizer(self.student, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("Student", self.student, self.optim, self.sched)
         # Registered without an optimizer/scheduler: EMA-updated, never trained by gradient.
         self.register_model("TeacherNow", self.teacher_now, None, None)
         # No gradient, no EMA -- a permanent, never-touched snapshot.
         self.register_model("TeacherInit", self.teacher_init, None, None)
+
+        if self.use_cmkd:
+            # student_mlp gets its OWN optimizer/scheduler, cloned from cfg.OPTIM but
+            # with a different LR and no warmup -- see train.py's CMKD_LR comment.
+            # Registering it lets Dassl's own update_lr()/model_backward_and_update
+            # machinery step it automatically alongside "Student", instead of manual
+            # bookkeeping -- also means gradient-norm clipping (max_norm=20.0 in
+            # forward_backward) now covers student_mlp's params too when its name is
+            # included there.
+            mlp_optim_cfg = cfg.OPTIM.clone()
+            mlp_optim_cfg.LR = cfg.TRAINER.PHPLMOMENTUM.CMKD_LR
+            mlp_optim_cfg.WARMUP_EPOCH = 0
+            self.mlp_optim = build_optimizer(self.student_mlp, mlp_optim_cfg)
+            self.mlp_sched = build_lr_scheduler(self.mlp_optim, mlp_optim_cfg)
+            self.register_model("StudentMLP", self.student_mlp, self.mlp_optim, self.mlp_sched)
 
         self.t_sne_path = osp.join(self.output_dir, "tsne")
         mkdir_if_missing(self.t_sne_path)
@@ -821,9 +833,10 @@ class PHPLMOMENTUM(BaseDA):
             loss_cmkd = torch.tensor(0.0, device=self.device)
 
         loss = loss_x + loss_u + self.mmd_weight * loss_mmd + loss_mix + loss_scl + loss_cmkd
+        backward_names = ["Student", "StudentMLP"] if self.use_cmkd else "Student"
         self.model_backward_and_update_with_gradient_monitoring(
             loss,
-            names="Student",
+            names=backward_names,
             max_norm=20.0,
             monitor_interval=10,
             clip_on_explosion=True,
