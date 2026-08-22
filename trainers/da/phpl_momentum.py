@@ -36,7 +36,9 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
     target view (asymmetric-view self-training, reduces confirmation bias) -- but only if
     cfg.TRAINER.PHPLMOMENTUM.USE_STRONG_AUG is set True. Default (False) is no weak/strong
     split at all: student and teachers all see PHPL's own single augmentation pipeline.
-  - loss_mmd (Multi-Kernel MMD between source/target student features) is kept, same as PHPL.
+  - loss_mmd (Multi-Kernel MMD between source/target student features) is kept, same as
+    PHPL, weighted by cfg.TRAINER.PHPLMOMENTUM.MMD_WEIGHT (default 1.0, unchanged; 0.0
+    disables it entirely, skipping the computation).
   - Optional CutMix (cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX, default off): cuts a random box
     out of image_u_strong and pastes it into image_x (both already strong-aug), and adds
     an extra loss_mix = lam*CE(pred_mix, label_x) + (1-lam)*CE(pred_mix, pseudo_label) to
@@ -187,6 +189,8 @@ class PHPLMOMENTUM(BaseDA):
         if self.use_debias:
             # Single EMA tracker shared between teacher_now and teacher_init.
             self.qhat = torch.full((self.num_classes,), 1.0 / self.num_classes, device=self.device)
+
+        self.mmd_weight = cfg.TRAINER.PHPLMOMENTUM.MMD_WEIGHT
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME}) x3 (student, teacher_now, teacher_init)")
         clip_model_student = load_clip_to_cpu(cfg)
@@ -377,7 +381,10 @@ class PHPLMOMENTUM(BaseDA):
             epsilon = 1e-8
             loss_u = (F.cross_entropy(logits_u, pseudo_label, reduction="none") * mask).sum() / (mask.sum() + epsilon)
 
-        loss_mmd = MK_MMD(feat_x, feat_u)
+        if self.mmd_weight > 0:
+            loss_mmd = MK_MMD(feat_x, feat_u)
+        else:
+            loss_mmd = torch.tensor(0.0, device=self.device)
 
         if self.use_cutmix:
             # Cut a box out of image_u_strong and paste it into image_x (both
@@ -393,7 +400,7 @@ class PHPLMOMENTUM(BaseDA):
         else:
             loss_mix = torch.tensor(0.0, device=self.device)
 
-        loss = loss_x + loss_u + loss_mmd + loss_mix
+        loss = loss_x + loss_u + self.mmd_weight * loss_mmd + loss_mix
         self.model_backward_and_update_with_gradient_monitoring(
             loss,
             names="Student",

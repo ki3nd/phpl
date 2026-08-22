@@ -224,6 +224,11 @@ def extend_cfg(cfg, args):
         cfg.TRAINER.PHPLMOMENTUM.DEBIAS_TAU = 0.5
         cfg.TRAINER.PHPLMOMENTUM.DEBIAS_MOMENTUM = 0.99
 
+        # Weight on loss_mmd (Multi-Kernel MMD between source/target student features)
+        # in the total loss. Default 1.0 (unchanged, same as PHPL). Set to 0.0 to
+        # disable it entirely.
+        cfg.TRAINER.PHPLMOMENTUM.MMD_WEIGHT = 1.0
+
         # CutMix between source (image_x) and target (image_u_strong), both strong-aug:
         # adds an extra loss_mix term (opt-in, default off, doesn't change existing behavior).
         cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX = False
