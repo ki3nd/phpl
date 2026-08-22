@@ -117,6 +117,11 @@ def extend_cfg(cfg, args):
     cfg.MODEL.NUM_LAYER = 12        # as model change, this param need to be changed
     cfg.DATASET.NUM_SHOTS = None    # optional
     cfg.SAVE_MODEL = True
+    # Dassl's base config never defines MODEL_DIR -- reset_cfg() only ever
+    # creates the attribute when --model-dir is actually passed. Pre-declare it
+    # here so `if cfg.MODEL_DIR:` in main() doesn't raise AttributeError when
+    # it's not.
+    cfg.MODEL_DIR = ""
     # Dassl's own default (0) only writes "LoRA-last" once, at the true final
     # epoch -- an interrupted/crashed/still-running training has no "latest"
     # checkpoint to load at all until then. Save it every epoch instead.
