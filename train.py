@@ -117,6 +117,10 @@ def extend_cfg(cfg, args):
     cfg.MODEL.NUM_LAYER = 12        # as model change, this param need to be changed
     cfg.DATASET.NUM_SHOTS = None    # optional
     cfg.SAVE_MODEL = True
+    # Dassl's own default (0) only writes "LoRA-last" once, at the true final
+    # epoch -- an interrupted/crashed/still-running training has no "latest"
+    # checkpoint to load at all until then. Save it every epoch instead.
+    cfg.TRAIN.CHECKPOINT_FREQ = 1
     cfg.TEST.FINAL_MODEL == "best_val"
     
     if args.trainer == 'CLIP_ZS' or args.trainer == 'CLIP_LR' or args.trainer == 'CLIP_FC' or args.trainer == 'CLIP_FT':
