@@ -191,6 +191,17 @@ def extend_cfg(cfg, args):
 
         # Mean-Teacher / momentum self-training specific:
         cfg.TRAINER.PHPLMOMENTUM.EMA_MOMENTUM = 0.996  # teacher_now <- momentum*teacher_now + (1-momentum)*student
+        # Per-depth EMA momentum override (opt-in, default [] = disabled -- every
+        # LoRA param uses the single EMA_MOMENTUM above, unchanged). If non-empty,
+        # EMA_MOMENTUM_RAMP must be the same length as EMA_MOMENTUM_RAMP_BOUNDARIES;
+        # a transformer block whose index >= boundaries[i] uses EMA_MOMENTUM_RAMP[i]
+        # instead (same breakpoint style as RANK_RAMP, but a SEPARATE list -- doesn't
+        # have to match RANK_RAMP's own boundaries). LoRA params with no resolvable
+        # block index (shouldn't normally occur) fall back to EMA_MOMENTUM.
+        # No literature precedent found for this (unlike per-layer LR decay, which is
+        # standard) -- an experimental idea, not a validated technique.
+        cfg.TRAINER.PHPLMOMENTUM.EMA_MOMENTUM_RAMP_BOUNDARIES = [2, 4, 6, 8, 10]
+        cfg.TRAINER.PHPLMOMENTUM.EMA_MOMENTUM_RAMP = []
         cfg.TRAINER.PHPLMOMENTUM.CONFI = 0.85  # confidence threshold for masking loss_u, same as PHPL.CONFI
         # loss_u weighting strategy:
         #   "mask" (default): PHPL's own strategy -- average CE only over samples

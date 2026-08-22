@@ -16,7 +16,12 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
     untouched-by-LoRA model for a fair, apples-to-apples comparison against PHPL.
   - teacher_now's LoRA weights are updated by EMA/momentum from student's LoRA after every
     step (no gradient, no optimizer) -- classic Mean-Teacher. teacher_init is a
-    permanent, never-touched snapshot of the original pretrained CLIP.
+    permanent, never-touched snapshot of the original pretrained CLIP. Optionally
+    (cfg.TRAINER.PHPLMOMENTUM.EMA_MOMENTUM_RAMP, default [] = disabled, a single
+    EMA_MOMENTUM everywhere), different transformer-block depths can use different
+    momentum values (same breakpoint style as loralib's RANK_RAMP, own separate
+    list) -- experimental, no literature precedent found for per-depth EMA
+    momentum specifically (unlike per-layer LR decay, which is standard).
   - Pseudo-label for the student comes from a logit-space blend of teacher_now and
     teacher_init -- same formula as PHPL's CustomCLIP.forward:
         beta = epoch / (max_epoch - 1)
@@ -89,6 +94,7 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
 """
 import os.path as osp
 import random
+import re
 
 import torch
 import torch.nn as nn
@@ -200,13 +206,44 @@ def _copy_lora_params(src_model, dst_model):
         dst_state[k].copy_(v)
 
 
+_BLOCK_IDX_RE = re.compile(r"resblocks\.(\d+)\.")
+
+
+def _block_index(key):
+    """Transformer block index parsed out of a LoRA state_dict key (e.g.
+    "text_encoder.transformer.resblocks.3.attn.q_proj.w_lora_A" -> 3), or None
+    if the key doesn't match that pattern."""
+    m = _BLOCK_IDX_RE.search(key)
+    return int(m.group(1)) if m else None
+
+
+def _momentum_for_key(key, base_momentum, boundaries, ramp):
+    """Per-depth EMA momentum override -- see train.py's EMA_MOMENTUM_RAMP
+    comment. Same breakpoint style as loralib/utils.py's _compute_rank (a block
+    whose index >= boundaries[i] uses ramp[i]), but a separate, independently
+    configurable list. Falls back to base_momentum if ramp is empty (the
+    default/disabled case) or the key has no resolvable block index."""
+    if not ramp:
+        return base_momentum
+    block_idx = _block_index(key)
+    if block_idx is None:
+        return base_momentum
+    for boundary, momentum in zip(reversed(boundaries), reversed(ramp)):
+        if block_idx >= boundary:
+            return momentum
+    return base_momentum
+
+
 @torch.no_grad()
-def _ema_update_lora_params(ema_model, src_model, momentum):
+def _ema_update_lora_params(ema_model, src_model, momentum_fn):
     """LoRA A/B are fp32 (see loralib/layers.py's _half_except_lora), so this
-    plain in-place EMA doesn't underflow the way it would on fp16 leaves."""
+    plain in-place EMA doesn't underflow the way it would on fp16 leaves.
+    `momentum_fn(key)` returns the momentum to use for that specific param --
+    pass e.g. `lambda k: 0.996` for a single constant momentum everywhere."""
     ema_state = ema_model.state_dict()
     for k, v in _lora_param_items(src_model):
-        ema_state[k].mul_(momentum).add_(v, alpha=1.0 - momentum)
+        m = momentum_fn(k)
+        ema_state[k].mul_(m).add_(v, alpha=1.0 - m)
 
 
 @TRAINER_REGISTRY.register()
@@ -218,6 +255,14 @@ class PHPLMOMENTUM(BaseDA):
         self.domains = cfg.DOMAINS
         self.save = cfg.SAVE_MODEL
         self.ema_momentum = cfg.TRAINER.PHPLMOMENTUM.EMA_MOMENTUM
+        self.ema_momentum_ramp_boundaries = cfg.TRAINER.PHPLMOMENTUM.EMA_MOMENTUM_RAMP_BOUNDARIES
+        self.ema_momentum_ramp = cfg.TRAINER.PHPLMOMENTUM.EMA_MOMENTUM_RAMP
+        if self.ema_momentum_ramp and len(self.ema_momentum_ramp) != len(self.ema_momentum_ramp_boundaries):
+            raise ValueError(
+                "TRAINER.PHPLMOMENTUM.EMA_MOMENTUM_RAMP must be the same length as "
+                f"EMA_MOMENTUM_RAMP_BOUNDARIES ({len(self.ema_momentum_ramp_boundaries)}), "
+                f"got {len(self.ema_momentum_ramp)}"
+            )
         self.confi = cfg.TRAINER.PHPLMOMENTUM.CONFI
         self.loss_u_mode = cfg.TRAINER.PHPLMOMENTUM.LOSS_U_MODE
         if self.loss_u_mode not in ("mask", "ratio"):
@@ -568,7 +613,13 @@ class PHPLMOMENTUM(BaseDA):
             clip_on_explosion=True,
         )
 
-        _ema_update_lora_params(self.teacher_now, self.student, self.ema_momentum)
+        if self.ema_momentum_ramp:
+            momentum_fn = lambda k: _momentum_for_key(  # noqa: E731
+                k, self.ema_momentum, self.ema_momentum_ramp_boundaries, self.ema_momentum_ramp
+            )
+        else:
+            momentum_fn = lambda k: self.ema_momentum  # noqa: E731
+        _ema_update_lora_params(self.teacher_now, self.student, momentum_fn)
 
         loss_summary = {
             "loss": loss.item(),
