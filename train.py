@@ -426,6 +426,17 @@ def main(args):
         trainer.test()
         return
 
+    if cfg.MODEL_DIR:
+        # Load a checkpoint (e.g. CMKD phase 1's finished LoRA weights) before
+        # training starts, instead of training from scratch -- lets a later
+        # stage (e.g. CMKD phase 2, run as its own command with
+        # TRAINER.PHPLMOMENTUM.CMKD_START_EPOCH=0) be re-run/debugged without
+        # re-running everything before it. --load-epoch selects "LoRA-last"
+        # (any int works: load_model() only checks whether epoch is None, not
+        # its value); omit it to load "LoRA-best" instead.
+        print(f"Loading checkpoint from {cfg.MODEL_DIR} before training")
+        trainer.load_model(cfg.MODEL_DIR, epoch=args.load_epoch)
+
     if not args.no_train:
         trainer.train()
 
@@ -439,7 +450,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset-config-file", type=str, default="",
                         help="path to config file for dataset setup")
     parser.add_argument("--model-dir", type=str, default="",
-                        help="load model from this directory for eval-only mode")
+                        help="load model from this directory (for eval-only mode, "
+                             "or to continue training from a checkpoint)")
     
     parser.add_argument("--domains", type=str, help="domains for DA/DG")
     parser.add_argument("--source-domains", type=str, nargs="+", help="source domains for DA/DG")
