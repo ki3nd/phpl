@@ -260,9 +260,13 @@ def _gini_impurity(pred, coe=1.0):
     (a softmax distribution), normalized per-class by that class's total mass in
     the batch (sum_dim) to avoid the degenerate "always predict the majority
     class" failure mode plain entropy minimization is prone to. `coe` is a
-    per-sample weight (e.g. agreement with another branch)."""
+    per-sample weight (e.g. agreement with another branch). Averaged over the
+    batch (not summed, unlike VLP-UDA's own formula) so it stays on the same
+    per-sample scale as mlp_loss_x's mean-reduced CE -- summing let this term's
+    gradient (scaling with batch_size) drown out CE's under plain SGD, and
+    mlp_loss_x/acc_source_mlp never moved off random-init levels as a result."""
     sum_dim = pred.sum(dim=0, keepdim=True).detach().clamp(min=1e-8)
-    return torch.sum(coe * (1 - torch.sum(pred ** 2 / sum_dim, dim=-1)))
+    return torch.mean(coe * (1 - torch.sum(pred ** 2 / sum_dim, dim=-1)))
 
 
 def _calibrated_coefficient(pred, pred_reference):
