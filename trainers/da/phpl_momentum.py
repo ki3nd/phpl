@@ -37,6 +37,14 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
         batch's loss_u is scaled by mask_ratio (the fraction of the batch that clears
         CONFI), so confidence still gates how much loss_u matters but never zeroes it
         out just because no single sample individually clears CONFI. Opt-in only.
+      "kd": bypasses hard pseudo-labels/thresholding entirely (THRESHOLD_MODE has no
+        effect in this mode). CLIP's own logit_scale (~100) already saturates softmax
+        toward 0/1, so any confidence threshold ends up cutting an already near-binary
+        distribution. Instead distills the student toward the fused-teacher
+        distribution, softened by cfg.TRAINER.PHPLMOMENTUM.KD_TEMPERATURE (default 4.0,
+        >1 softens), via KL-divergence -- every target sample contributes, weighted
+        implicitly by student/teacher agreement, no hard cutoff needed. Same idea as
+        EKDA's own student-training KD loss.
   - The confidence mask itself follows cfg.TRAINER.PHPLMOMENTUM.THRESHOLD_MODE:
       "fixed" (default): a single CONFI for every class, every epoch (unchanged).
       "flexmatch": from epoch 2 onward, each class gets its own threshold
@@ -274,8 +282,11 @@ class PHPLMOMENTUM(BaseDA):
             )
         self.confi = cfg.TRAINER.PHPLMOMENTUM.CONFI
         self.loss_u_mode = cfg.TRAINER.PHPLMOMENTUM.LOSS_U_MODE
-        if self.loss_u_mode not in ("mask", "ratio"):
-            raise ValueError(f"Unknown TRAINER.PHPLMOMENTUM.LOSS_U_MODE: {self.loss_u_mode!r} (expected 'mask' or 'ratio')")
+        if self.loss_u_mode not in ("mask", "ratio", "kd"):
+            raise ValueError(
+                f"Unknown TRAINER.PHPLMOMENTUM.LOSS_U_MODE: {self.loss_u_mode!r} (expected 'mask', 'ratio', or 'kd')"
+            )
+        self.kd_temperature = cfg.TRAINER.PHPLMOMENTUM.KD_TEMPERATURE
         self.use_cutmix = cfg.TRAINER.PHPLMOMENTUM.USE_CUTMIX
         self.cutmix_alpha = cfg.TRAINER.PHPLMOMENTUM.CUTMIX_ALPHA
         self.beta_power = cfg.TRAINER.PHPLMOMENTUM.BETA_POWER
@@ -629,6 +640,17 @@ class PHPLMOMENTUM(BaseDA):
             # DACS-style: never drop samples from the loss -- scale the WHOLE
             # batch's loss_u by the fraction that clears CONFI.
             loss_u = F.cross_entropy(logits_u, pseudo_label) * mask_ratio
+        elif self.loss_u_mode == "kd":
+            # Bypasses hard pseudo-labels/thresholding entirely -- distill the
+            # student toward the (softened) fused-teacher distribution directly.
+            # logits_fusion was computed under torch.no_grad() above, so only
+            # logits_u (student) carries gradient here, as intended.
+            T = self.kd_temperature
+            loss_u = F.kl_div(
+                F.log_softmax(logits_u / T, dim=1),
+                F.softmax(logits_fusion / T, dim=1),
+                reduction="batchmean",
+            ) * (T * T)
         else:
             # PHPL's own strategy: average CE only over samples that clear CONFI.
             # Can hit "0 samples pass -> loss_u == 0" early in training.

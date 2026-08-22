@@ -208,7 +208,17 @@ def extend_cfg(cfg, args):
         #       whose confidence clears CONFI (can hit 0 if none clear it in a batch).
         #   "ratio": never drop samples -- scale the WHOLE batch's CE by the fraction
         #       that clears CONFI. Opt-in only, via TRAINER.PHPLMOMENTUM.LOSS_U_MODE ratio.
+        #   "kd": bypasses hard pseudo-labels/thresholding entirely -- CLIP's own
+        #       logit_scale (~100 after training) already saturates softmax outputs
+        #       toward 0/1, so ANY confidence threshold ends up drawing a line on an
+        #       already near-binary distribution with little room left to matter.
+        #       "kd" instead distills the student toward the (softened, via
+        #       KD_TEMPERATURE) teacher distribution with KL-divergence -- every
+        #       target sample contributes, weighted implicitly by how much student
+        #       and teacher already agree, no hard cutoff needed. Same idea as
+        #       EKDA's own student-training KD loss.
         cfg.TRAINER.PHPLMOMENTUM.LOSS_U_MODE = "mask"
+        cfg.TRAINER.PHPLMOMENTUM.KD_TEMPERATURE = 4.0  # >1 softens the (over-sharp) teacher distribution
 
         # beta = (epoch / (max_epoch - 1)) ** BETA_POWER, then
         # logits_fusion = beta*teacher_now + (1-beta)*teacher_init.
