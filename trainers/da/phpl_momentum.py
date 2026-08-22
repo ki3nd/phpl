@@ -105,12 +105,27 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
     regularizes the student's text/source-image features against drifting too far
     from pure zero-shot CLIP, independent of teacher_init's (fading) role in
     pseudo-labeling. No KL term on logits (EKDA also has one; opted out here).
+  - Optional CMKD (cfg.TRAINER.PHPLMOMENTUM.USE_CMKD, default off, VLP-UDA-style): a small
+    learned MLP (student_mlp) on top of image features feat_x/feat_u, separate from CLIP's
+    cosine-similarity classification -- not constrained to CLIP's fixed text-embedding
+    geometry or logit_scale's saturation. Trained via mlp_loss_x (plain CE on source) plus
+    an agreement-weighted entropy-min (Gini-impurity) objective on target: samples where
+    the MLP agrees with prob_fusion (the SAME beta-blended teacher_now/teacher_init
+    probability already used for the CONFI mask) get their OWN prediction sharpened
+    (task_loss); samples where they disagree get the 50/50-averaged prediction sharpened
+    instead (distill_loss) -- never a hard CE-to-pseudo-label, avoiding the MLP just
+    re-learning cosine-similarity's own (possibly saturated) decision function.
+    No regularization term on the cosine branch itself (VLP-UDA's own reg_loss) -- loss_scl
+    already serves that role when USE_SCL is on, and LoRA already adapts that branch via
+    loss_x/loss_u. teacher_now_mlp is EMA-updated from student_mlp (mirroring teacher_now's
+    LoRA) and used ONLY for evaluation (test() logs both branches' accuracy side by side).
   - Evaluation uses teacher_now (the adapting EMA teacher), not the student. save_model/
     load_model persist teacher_now's own LoRA snapshot directly (a separate "TeacherNow"
     checkpoint dir, alongside "Student") -- reconstructing it by re-copying student's
     weights at load time would give a DIFFERENT (raw, non-EMA'd) model than whatever
     teacher_now's EMA state actually was when that epoch's eval score was recorded.
 """
+import math
 import os.path as osp
 import random
 import re
@@ -213,6 +228,56 @@ def _text_features(model):
     teacher_init(), test())."""
     text_features = model.text_encoder(model.tokenized_prompts.to(model.logit_scale.device))
     return text_features / text_features.norm(dim=-1, keepdim=True)
+
+
+class _MLPHead(nn.Module):
+    """Small learned classifier on top of image features -- CMKD's own
+    (VLP-UDA-style) alternative to CLIP's fixed cosine-similarity classification."""
+
+    def __init__(self, feat_dim, hidden_dim, num_classes):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def _cmkd_lamb(cur_iter, max_iter):
+    """VLP-UDA's own LambdaSheduler: a sigmoid ramp 0 -> 1 over max_iter steps."""
+    p = min(cur_iter / max_iter, 1.0)
+    return 2.0 / (1.0 + math.exp(-p)) - 1.0
+
+
+def _gini_impurity(pred, coe=1.0):
+    """Class-balanced entropy-minimization term (CMKD/VLP-UDA): sharpens `pred`
+    (a softmax distribution), normalized per-class by that class's total mass in
+    the batch (sum_dim) to avoid the degenerate "always predict the majority
+    class" failure mode plain entropy minimization is prone to. `coe` is a
+    per-sample weight (e.g. agreement with another branch)."""
+    sum_dim = pred.sum(dim=0, keepdim=True).detach().clamp(min=1e-8)
+    return torch.sum(coe * (1 - torch.sum(pred ** 2 / sum_dim, dim=-1)))
+
+
+def _calibrated_coefficient(pred, pred_reference):
+    """CMKD's per-sample agreement weight between two predicted distributions:
+    exp(-KL(pred, pred_reference)), close to 1 when they agree, close to 0 when
+    they disagree. Detached -- used only as a fixed weight, not backprop'd through."""
+    epsilon = 1e-8
+    distance = F.kl_div((pred + epsilon).log(), pred_reference, reduction="none").sum(-1)
+    return torch.exp(-distance).detach()
+
+
+@torch.no_grad()
+def _ema_update_module(ema_module, src_module, momentum):
+    """Generic parameter-wise EMA for a plain nn.Module (unlike
+    _ema_update_lora_params, not filtered to keys containing "lora_")."""
+    ema_state = ema_module.state_dict()
+    for k, v in src_module.state_dict().items():
+        ema_state[k].mul_(momentum).add_(v, alpha=1.0 - momentum)
 
 
 def _lora_param_items(model):
@@ -424,7 +489,22 @@ class PHPLMOMENTUM(BaseDA):
         else:
             raise ValueError('Training batch name is wrong!')
 
-        self.optim = build_optimizer(self.student, cfg.OPTIM)
+        self.use_cmkd = cfg.TRAINER.PHPLMOMENTUM.USE_CMKD
+        if self.use_cmkd:
+            feat_dim = clip_model_student.text_projection.shape[1]
+            self.student_mlp = _MLPHead(feat_dim, cfg.TRAINER.PHPLMOMENTUM.CMKD_HIDDEN_DIM, self.num_classes).to(self.device)
+            self.teacher_now_mlp = _MLPHead(feat_dim, cfg.TRAINER.PHPLMOMENTUM.CMKD_HIDDEN_DIM, self.num_classes).to(self.device)
+            self.teacher_now_mlp.load_state_dict(self.student_mlp.state_dict())
+            for param in self.teacher_now_mlp.parameters():
+                param.requires_grad_(False)
+            self.cmkd_lambda1 = cfg.TRAINER.PHPLMOMENTUM.CMKD_LAMBDA1
+            self.cmkd_iter = 0
+            self.cmkd_max_iter = max(self.max_epoch * self.num_batches, 1)
+
+        # student_mlp's params need to share the SAME optimizer as student's LoRA
+        # params (a single combined module, when CMKD is on) so both get updated.
+        optim_target = nn.ModuleList([self.student, self.student_mlp]) if self.use_cmkd else self.student
+        self.optim = build_optimizer(optim_target, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("Student", self.student, self.optim, self.sched)
         # Registered without an optimizer/scheduler: EMA-updated, never trained by gradient.
@@ -712,7 +792,30 @@ class PHPLMOMENTUM(BaseDA):
             loss_scl_image_raw = torch.tensor(0.0, device=self.device)
             loss_scl = torch.tensor(0.0, device=self.device)
 
-        loss = loss_x + loss_u + self.mmd_weight * loss_mmd + loss_mix + loss_scl
+        if self.use_cmkd:
+            # CMKD (VLP-UDA-style): a learned MLP head, trained via plain source CE
+            # plus an agreement-weighted entropy-min objective on target, comparing
+            # against prob_fusion -- the SAME beta-blended teacher_now/teacher_init
+            # probability already computed above for the CONFI/threshold mask, reused
+            # here rather than recomputed (already detached, under no_grad).
+            mlp_logits_x = self.student_mlp(feat_x)
+            mlp_loss_x = F.cross_entropy(mlp_logits_x, label_x)
+
+            mlp_logits_u = self.student_mlp(feat_u)
+            pred_mlp_u = F.softmax(mlp_logits_u, dim=1)
+            pred_teacher_u = prob_fusion
+            coe = _calibrated_coefficient(pred_mlp_u, pred_teacher_u)
+            pred_mix_u = 0.5 * (pred_mlp_u + pred_teacher_u)
+            lamb = _cmkd_lamb(self.cmkd_iter, self.cmkd_max_iter)
+
+            task_loss = self.cmkd_lambda1 * lamb * _gini_impurity(pred_mlp_u, coe)
+            distill_loss = self.cmkd_lambda1 * lamb * _gini_impurity(pred_mix_u, 1 - coe)
+            loss_cmkd = mlp_loss_x + task_loss + distill_loss
+            self.cmkd_iter += 1
+        else:
+            loss_cmkd = torch.tensor(0.0, device=self.device)
+
+        loss = loss_x + loss_u + self.mmd_weight * loss_mmd + loss_mix + loss_scl + loss_cmkd
         self.model_backward_and_update_with_gradient_monitoring(
             loss,
             names="Student",
@@ -728,6 +831,8 @@ class PHPLMOMENTUM(BaseDA):
         else:
             momentum_fn = lambda k: self.ema_momentum  # noqa: E731
         _ema_update_lora_params(self.teacher_now, self.student, momentum_fn)
+        if self.use_cmkd:
+            _ema_update_module(self.teacher_now_mlp, self.student_mlp, self.ema_momentum)
 
         loss_summary = {
             "loss": loss.item(),
@@ -736,6 +841,7 @@ class PHPLMOMENTUM(BaseDA):
             "loss_mmd": loss_mmd.item(),
             "loss_mix": loss_mix.item(),
             "loss_scl": loss_scl.item(),
+            "loss_cmkd": loss_cmkd.item(),
             "loss_scl_text_raw": loss_scl_text_raw.item(),
             "loss_scl_image_raw": loss_scl_image_raw.item(),
             "beta": beta,
@@ -752,7 +858,10 @@ class PHPLMOMENTUM(BaseDA):
 
     @torch.no_grad()
     def test(self, split=None):
-        """Evaluation uses teacher_now (the adapting EMA teacher), not the student."""
+        """Evaluation uses teacher_now (the adapting EMA teacher), not the student.
+        The official return value (used for best-model selection) is still teacher_now's
+        cosine-similarity accuracy; when USE_CMKD is on, teacher_now_mlp's accuracy is
+        also computed and logged (print + write_scalar) purely for comparison."""
         # No .eval() call needed -- _FrozenTeacherCLIP.train() (see build_model)
         # already forces this permanently.
         self.evaluator.reset()
@@ -763,10 +872,19 @@ class PHPLMOMENTUM(BaseDA):
         data_loader = self.test_loader
         print("Do evaluation on test set (teacher_now)")
 
+        mlp_correct, mlp_total = 0, 0
         for batch_idx, batch in enumerate(data_loader):
             input, label = self.parse_batch_test(batch)
-            logits, _ = self.teacher_now(input)
+            logits, feat = self.teacher_now(input)
             self.evaluator.process(logits, label)
+
+            if self.use_cmkd:
+                # Diagnostic only -- not the official metric, not used for
+                # best-model selection. Manual accuracy, not the full evaluator
+                # machinery (per-class/confusion-matrix stats not needed here).
+                mlp_logits = self.teacher_now_mlp(feat)
+                mlp_correct += (mlp_logits.argmax(dim=-1) == label).sum().item()
+                mlp_total += label.size(0)
 
         if self.cfg.DATASET.NAME == "VisDA17":
             results, accs = self.evaluator.evaluate()
@@ -776,6 +894,11 @@ class PHPLMOMENTUM(BaseDA):
         for k, v in results.items():
             tag = "{}/{}".format(split, k)
             self.write_scalar(tag, v, self.epoch)
+
+        if self.use_cmkd:
+            mlp_acc = 100.0 * mlp_correct / max(mlp_total, 1)
+            print(f"[cmkd] epoch {self.epoch + 1}: teacher_now_mlp accuracy = {mlp_acc:.2f}%")
+            self.write_scalar("{}/mlp_accuracy".format(split), mlp_acc, self.epoch)
 
         return results["accuracy"]
 

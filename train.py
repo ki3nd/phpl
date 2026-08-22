@@ -265,6 +265,27 @@ def extend_cfg(cfg, args):
         cfg.TRAINER.PHPLMOMENTUM.SCL_TEXT_WEIGHT = 25.0
         cfg.TRAINER.PHPLMOMENTUM.SCL_IMAGE_WEIGHT = 10.0
 
+        # CMKD (Cross-Modal Knowledge Distillation, VLP-UDA-style), opt-in, default off.
+        # Adds a small learned MLP classifier on top of image features (feat_x/feat_u),
+        # separate from CLIP's own cosine-similarity classification -- since a freely
+        # learned head isn't constrained to CLIP's fixed text-embedding geometry, it can
+        # in principle fit a better decision boundary than cosine-similarity ever could,
+        # and it isn't tied to logit_scale's saturation behavior. No hard threshold: the
+        # MLP's target-domain training signal is a continuous, agreement-weighted entropy
+        # (Gini-impurity) objective against the student's own existing cosine-similarity
+        # branch (logits_u), not a hard pseudo-label -- avoids the MLP just re-learning
+        # cosine-similarity's own (possibly saturated) decision function via CE-to-a-label.
+        # teacher_now_mlp is EMA-updated from student_mlp (mirroring LoRA's teacher_now)
+        # and used ONLY for evaluation (test() logs both the existing cosine-branch
+        # accuracy and this MLP branch's, side by side) -- never trained directly.
+        # No regularization term on the cosine branch itself (VLP-UDA's own reg_loss
+        # entropy-min on their "clip" branch) -- that branch is already LoRA-adapted via
+        # the existing loss_x/loss_u/etc., an extra entropy-min pass on it wasn't found
+        # to help.
+        cfg.TRAINER.PHPLMOMENTUM.USE_CMKD = False
+        cfg.TRAINER.PHPLMOMENTUM.CMKD_HIDDEN_DIM = 256
+        cfg.TRAINER.PHPLMOMENTUM.CMKD_LAMBDA1 = 1.0  # weight on the entropy-min (task+distill) terms
+
         # Confidence-mask threshold strategy:
         #   "fixed" (default): a single CONFI for every class, every epoch (unchanged).
         #   "flexmatch": epoch 1 (warmup) still uses the plain fixed CONFI threshold;
