@@ -1019,10 +1019,18 @@ class PHPLMOMENTUM(BaseDA):
             tag = "{}/{}".format(split, k)
             self.write_scalar(tag, v, self.epoch)
 
+        in_cmkd_phase = self.use_cmkd and self.epoch >= self.cmkd_start_epoch
         if self.use_cmkd:
             mlp_acc = 100.0 * mlp_correct / max(mlp_total, 1)
             print(f"[cmkd] epoch {self.epoch + 1}: student_mlp accuracy = {mlp_acc:.2f}%")
             self.write_scalar("{}/mlp_accuracy".format(split), mlp_acc, self.epoch)
+
+        if in_cmkd_phase:
+            # teacher_now is frozen throughout phase 2 -- its cosine accuracy
+            # (results["accuracy"]) is constant every epoch and useless for
+            # best-model selection there. student_mlp is the model actually
+            # training in phase 2, so its accuracy is the official metric instead.
+            return mlp_acc
 
         return results["accuracy"]
 
@@ -1039,6 +1047,16 @@ class PHPLMOMENTUM(BaseDA):
         mkdir_if_missing(teacher_now_dir)
         save_lora(self.cfg, self.list_lora_layers_teacher_now, teacher_now_dir, filename=filename)
 
+        if self.use_cmkd:
+            # Not LoRA -- save_lora/load_lora only handle the lora_A/lora_B
+            # tensors on CustomCLIP's layers, not a standalone nn.Module's own
+            # state_dict. student_mlp is the model actually training in phase 2
+            # (test() returns its accuracy as the official metric there), so it
+            # must be checkpointed too or "is_best" saves would be a no-op.
+            mlp_dir = osp.join(directory, "StudentMLP")
+            mkdir_if_missing(mlp_dir)
+            torch.save(self.student_mlp.state_dict(), osp.join(mlp_dir, f"{filename}.pt"))
+
     def load_model(self, directory, epoch=None):
         if not directory:
             print("Note that load_model() is skipped as no pretrained model is given")
@@ -1046,3 +1064,10 @@ class PHPLMOMENTUM(BaseDA):
         filename = "LoRA-last" if epoch is not None else "LoRA-best"
         load_lora(self.cfg, self.list_lora_layers, osp.join(directory, "Student"), filename=filename)
         load_lora(self.cfg, self.list_lora_layers_teacher_now, osp.join(directory, "TeacherNow"), filename=filename)
+
+        if self.use_cmkd:
+            mlp_path = osp.join(directory, "StudentMLP", f"{filename}.pt")
+            if osp.exists(mlp_path):
+                self.student_mlp.load_state_dict(torch.load(mlp_path, map_location=self.device))
+            else:
+                print(f"Note: no student_mlp checkpoint at {mlp_path}, keeping its current (random-init) weights")
