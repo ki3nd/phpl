@@ -23,7 +23,10 @@ Usage:
         --config-file configs/trainers/PHPL/b32_ep10_officehome.yaml \\
         --phase1-dir output/PHPLMOMENTUM/1/officehome/a-c \\
         --output-dir output/PHPLMOMENTUM/2/officehome/a-c \\
-        --total-iters 2000 --print-freq 50 --eval-freq 200
+        --print-freq 50 --eval-freq 500
+    (all other flags default to VLP-UDA's own office_home.yaml values --
+    total-iters=10000, optim=sgd lr=0.003 momentum=0.9 nesterov weight-decay=5e-4,
+    lr-schedule=vlpuda, lambda1=0.25, lamb-gamma=1.0)
 """
 import argparse
 import math
@@ -136,7 +139,7 @@ def main():
                          help="phase 1's output dir (contains a TeacherNow/ subdir)")
     parser.add_argument("--phase1-checkpoint", choices=["last", "best"], default="last")
 
-    parser.add_argument("--total-iters", type=int, default=2000)
+    parser.add_argument("--total-iters", type=int, default=10000)
     parser.add_argument("--print-freq", type=int, default=50)
     parser.add_argument("--eval-freq", type=int, default=200)
 
@@ -145,14 +148,29 @@ def main():
     # has naturally small, per-parameter-uneven mean-CE gradients (confirmed via a
     # real run -- SGD at lr=0.01 left mlp_loss_x pinned at ln(num_classes) after
     # 200 iterations). Adam's per-parameter adaptivity is the standard choice for
-    # this kind of linear-probe-style training, unlike LoRA's own SGD.
-    parser.add_argument("--optim", choices=["sgd", "adam", "adamw"], default="adam")
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--lr-schedule", choices=["none", "cosine"], default="cosine")
+    # this kind of linear-probe-style training, unlike LoRA's own SGD. Defaults
+    # below match VLP-UDA's own office_home.yaml as closely as possible instead
+    # (optim=sgd, lr=0.003 = their backbone lr 3e-6 * multiple_lr_classifier
+    # 1000, momentum=0.9 nesterov=True, weight_decay=5e-4, lr-schedule=vlpuda,
+    # lambda1=0.25, lamb-gamma=1.0, total-iters=10000 = their n_epoch(20) *
+    # n_iter_per_epoch(500)) -- pass --optim adam/--lr 1e-3 to use the
+    # confirmed-working alternative instead (see the commit that added Adam:
+    # SGD at a naive lr=0.01 left mlp_loss_x pinned at ln(num_classes) after
+    # 200 iterations in an earlier, less faithfully-matched attempt).
+    parser.add_argument("--optim", choices=["sgd", "adam", "adamw"], default="sgd")
+    parser.add_argument("--lr", type=float, default=0.003)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
+    # "vlpuda": their own decay shape (1+lr_gamma*step)^(-lr_decay), stepped every
+    # iteration -- NOT multiplying by --lr again inside the lambda (LambdaLR
+    # already does base_lr * lambda(step); their own code appears to double this
+    # up, since their optimizer's base lr is already args.lr too).
+    parser.add_argument("--lr-schedule", choices=["none", "cosine", "vlpuda"], default="vlpuda")
+    parser.add_argument("--lr-gamma", type=float, default=0.0003, help="vlpuda schedule only")
+    parser.add_argument("--lr-decay", type=float, default=0.75, help="vlpuda schedule only")
 
     parser.add_argument("--lambda1", type=float, default=0.25)
-    parser.add_argument("--lamb-gamma", type=float, default=10.0)
+    parser.add_argument("--lamb-gamma", type=float, default=1.0)
 
     args = parser.parse_args()
 
@@ -192,7 +210,8 @@ def main():
 
     if args.optim == "sgd":
         optimizer = torch.optim.SGD(
-            student_mlp.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay
+            student_mlp.parameters(), lr=args.lr, momentum=args.momentum,
+            weight_decay=args.weight_decay, nesterov=True,
         )
     elif args.optim == "adamw":
         optimizer = torch.optim.AdamW(student_mlp.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -202,6 +221,11 @@ def main():
     scheduler = None
     if args.lr_schedule == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.total_iters)
+    elif args.lr_schedule == "vlpuda":
+        lr_gamma, lr_decay = args.lr_gamma, args.lr_decay
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda step: (1.0 + lr_gamma * step) ** (-lr_decay)
+        )
 
     best_acc = 0.0
     for it in range(args.total_iters):
