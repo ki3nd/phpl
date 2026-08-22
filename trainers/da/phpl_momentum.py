@@ -837,7 +837,17 @@ class PHPLMOMENTUM(BaseDA):
             momentum_fn = lambda k: self.ema_momentum  # noqa: E731
         _ema_update_lora_params(self.teacher_now, self.student, momentum_fn)
         if self.use_cmkd:
-            _ema_update_module(self.teacher_now_mlp, self.student_mlp, self.ema_momentum)
+            # student_mlp starts from random init (unlike LoRA, which starts already
+            # reconstructing the pretrained CLIP weight via SVD) -- a real EMA blend
+            # against that random starting point would leave teacher_now_mlp dominated
+            # by noise for a long time (0.996^100 ~= 0.67 still random after 1 epoch).
+            # Epoch 1: hard-copy every step instead (momentum=0, teacher_now_mlp exactly
+            # tracks student_mlp, no lag) so by epoch 2 it already reflects whatever
+            # student_mlp learned during epoch 1, not its original random init. Real EMA
+            # only starts from epoch 2 -- same "epoch 1 = warmup" pattern used elsewhere
+            # (BETA_POWER, THRESHOLD_MODE flexmatch/cbst).
+            mlp_momentum = 0.0 if self.epoch == 0 else self.ema_momentum
+            _ema_update_module(self.teacher_now_mlp, self.student_mlp, mlp_momentum)
 
         loss_summary = {
             "loss": loss.item(),
