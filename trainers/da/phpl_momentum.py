@@ -42,7 +42,9 @@ Differences vs. the original PHPL trainer (trainers/da/phpl.py):
         plain fixed threshold), so epoch 2 doesn't start every class's tau_c at 0.
         cfg.TRAINER.PHPLMOMENTUM.FLEXMATCH_MAPPING picks how beta_c maps to tau_c:
         "linear" (default, tau_c = beta_c*CONFI) or "convex" (FlexMatch's own
-        M(beta)=beta/(2-beta), rising faster than linear once any evidence exists).
+        M(beta)=beta/(2-beta) -- RISES SLOWER than linear while beta_c is still
+        low-to-moderate, only catching up sharply near beta_c=1; see train.py's
+        FLEXMATCH_MAPPING comment for the full explanation and a caveat).
       "flexmatch_v2": faithful to the actual FlexMatch paper (Zhang et al., NeurIPS
         2021) -- unlike "flexmatch" above, which is a simplified approximation.
         Keeps one slot per unlabeled sample (self.selected_label, size =
@@ -455,9 +457,10 @@ class PHPLMOMENTUM(BaseDA):
                 count_max = self.class_confident_count.max().clamp(min=1.0)
                 beta_c = self.class_confident_count / count_max
                 if self.flexmatch_mapping == "convex":
-                    # FlexMatch's own M(beta) = beta/(2-beta) -- >= beta_c everywhere
-                    # except at the 0/1 endpoints, so tau_c rises faster than linear
-                    # as soon as a class has ANY confident evidence.
+                    # FlexMatch's own M(beta) = beta/(2-beta) -- <= beta_c everywhere
+                    # except at the 0/1 endpoints, so tau_c rises SLOWER than linear
+                    # while confidence is still low-to-moderate (see train.py's
+                    # FLEXMATCH_MAPPING comment).
                     beta_c = beta_c / (2.0 - beta_c)
                 tau_c = beta_c * self.confi
                 mask = max_probs.ge(tau_c[pseudo_label]).float()

@@ -274,15 +274,19 @@ def extend_cfg(cfg, args):
         # Add new strategies as new elif branches in forward_backward, not new flags.
         cfg.TRAINER.PHPLMOMENTUM.THRESHOLD_MODE = "fixed"
 
-        # "flexmatch" mode only: how beta_c maps to a threshold multiplier.
+        # "flexmatch"/"flexmatch_v2" only: how beta_c maps to a threshold multiplier.
         #   "linear" (default, unchanged): tau_c = beta_c * CONFI.
         #   "convex": tau_c = (beta_c / (2 - beta_c)) * CONFI -- FlexMatch's OWN mapping
-        #       function M(beta) = beta/(2-beta). Since beta_c in [0,1], M(beta_c) >=
-        #       beta_c always (equal only at the endpoints 0 and 1), so tau_c rises
-        #       FASTER than linear as soon as a class has any confident evidence at
-        #       all -- shortens the "everything passes" window right after a class's
-        #       count leaves 0, at the cost of a steeper threshold later for classes
-        #       still catching up.
+        #       function M(beta) = beta/(2-beta). M is convex with M(0)=0, M(1)=1, so
+        #       it lies BELOW the identity line in between (M(beta_c) <= beta_c for
+        #       beta_c in (0,1), equal only at the 0/1 endpoints) -- tau_c rises
+        #       SLOWER than linear while a class's confidence is still low-to-moderate
+        #       (stays looser for longer), only catching up sharply as beta_c
+        #       approaches 1 (an already well-learned class). Matches the paper's own
+        #       description: "grow slowly when beta is small, more sensitive as beta
+        #       gets larger." NOTE: if classes are already collapsing toward tau_c near
+        #       0 (many rarely-confident classes), convex makes that worse, not better
+        #       -- it depresses their threshold even further below linear.
         cfg.TRAINER.PHPLMOMENTUM.FLEXMATCH_MAPPING = "linear"
 
         # CutMix between source (image_x) and target (image_u_strong), both strong-aug:
