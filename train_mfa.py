@@ -211,6 +211,11 @@ def main():
                               "initialized head elsewhere in this project.")
 
     parser.add_argument("--lambda1", type=float, default=0.25, help="Student 2's CMKD task/distill weight")
+    # CMKD's own reg_loss (models/cmkd.py's regularization_term) -- trains the
+    # cosine branch itself (CE on source with its own label + entropy-min on
+    # target), VLP-UDA's own defaults.
+    parser.add_argument("--lambda2", type=float, default=0.1, help="Student 2's CMKD reg_loss: CE weight on source cosine branch")
+    parser.add_argument("--lambda3", type=float, default=0.025, help="Student 2's CMKD reg_loss: entropy-min weight on target cosine branch")
     # VLP-UDA's own LambdaSheduler default -- lamb never reaches 1.0 with
     # this (maxes out at ~0.46, at the very end of training).
     parser.add_argument("--lamb-gamma", type=float, default=1.0, help="Student 2's lamb ramp gamma")
@@ -383,11 +388,11 @@ def main():
             label_x2 = batch_x2["label"].to(device)
             image_u2 = batch_u2["img"].to(device)
 
-            _, feat2_x2 = student2_backbone(image_x2)
+            logits2_x2_clip, feat2_x2 = student2_backbone(image_x2)
             logits2_x2 = student2_head(feat2_x2.float())
             loss_x2 = F.cross_entropy(logits2_x2, label_x2)
 
-            _, feat2_u2 = student2_backbone(image_u2)
+            logits2_u2_clip, feat2_u2 = student2_backbone(image_u2)
             logits2_u2 = student2_head(feat2_u2.float())
             pred2_u2 = F.softmax(logits2_u2, dim=1)
 
@@ -403,12 +408,23 @@ def main():
                     )
                 )
                 loss_u2_cross = torch.tensor(0.0, device=device)
+                reg_loss = torch.tensor(0.0, device=device)
                 loss2 = loss_x2 + loss_u2_self
                 lamb = 1.0  # no ramp during warmup -- there's only one (frozen) reference
             else:
+                # Self reference is student2_backbone's OWN cosine branch
+                # (logits2_u2_clip, computed in the SAME forward call as
+                # feat2_u2 above) -- matches CMKD's real design (models/
+                # cmkd.py + make_model.py's forward()): base_network's
+                # forward_features/forward_head are the SAME live network,
+                # no separate teacher/EMA involved for self-training at all.
+                # Detached to match CMKD's own task_loss/distill_loss (coe is
+                # already detached inside _calibrated_coefficient, and the
+                # mix term detaches target_pred_clip) -- only reg_loss below
+                # trains the cosine branch, via an UNDETACHED copy.
+                prob_self2 = F.softmax(logits2_u2_clip.detach(), dim=-1)
+                pred_self2_clip_live = F.softmax(logits2_u2_clip, dim=-1)
                 with torch.no_grad():
-                    _, feat_self2 = teacher2_backbone(image_u2)
-                    prob_self2 = F.softmax(teacher2_head(feat_self2.float()), dim=-1)
                     logits_t1_u2, _ = teacher1(image_u2)
                     prob_cross2 = F.softmax(logits_t1_u2, dim=-1)
 
@@ -425,7 +441,16 @@ def main():
                 else:
                     # Student1-style CONFI=0.85 hard-threshold mask + CE.
                     loss_u2_cross = _masked_ce(logits2_u2, prob_cross2)
-                loss2 = loss_x2 + loss_u2_self + args.cross_weight * loss_u2_cross
+
+                # CMKD's own reg_loss (models/cmkd.py's regularization_term):
+                # trains the cosine branch itself directly -- CE on source
+                # with its true label, plus entropy-min on target.
+                reg_loss = (
+                    args.lambda2 * F.cross_entropy(logits2_x2_clip, label_x2)
+                    + args.lambda3 * lamb * _gini_impurity(pred_self2_clip_live)
+                )
+
+                loss2 = loss_x2 + loss_u2_self + args.cross_weight * loss_u2_cross + reg_loss
 
             if in_warmup:
                 for pg in optim2_backbone.param_groups:
@@ -494,7 +519,7 @@ def main():
                 f"loss1 {loss1.item():.4f} (x {loss_x1.item():.4f} self {loss_u1_self.item():.4f} "
                 f"cross {loss_u1_cross.item():.4f} mmd {loss_mmd1.item():.4f}) acc_x1 {acc_x1:.2f} | "
                 f"loss2 {loss2.item():.4f} (x {loss_x2.item():.4f} self {loss_u2_self.item():.4f} "
-                f"cross {loss_u2_cross.item():.4f}) acc_x2 {acc_x2:.2f} lamb {lamb:.4f}"
+                f"cross {loss_u2_cross.item():.4f} reg {reg_loss.item():.4f}) acc_x2 {acc_x2:.2f} lamb {lamb:.4f}"
             )
 
         if (macro + 1) % args.eval_freq == 0 or (macro + 1) == args.s1_total_iters or (macro + 1) == args.warmup_iters:
