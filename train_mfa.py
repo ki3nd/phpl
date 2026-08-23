@@ -36,7 +36,7 @@ Usage:
         --dataset-config-file configs/datasets/officehome.yaml \\
         --config-file configs/trainers/PHPL/b32_ep10_officehome.yaml \\
         --output-dir output/MFA/officehome/a-c \\
-        --total-iters 2000 --print-freq 50 --eval-freq 200
+        --s1-total-iters 1000 --s2-per-s1 10 --print-freq 50 --eval-freq 200
 """
 import argparse
 import math
@@ -147,9 +147,28 @@ def main():
     parser.add_argument("--gpu", type=str, default="0")
     parser.add_argument("--seed", type=int, default=2)
 
-    parser.add_argument("--total-iters", type=int, default=2000)
-    parser.add_argument("--print-freq", type=int, default=50)
-    parser.add_argument("--eval-freq", type=int, default=200)
+    # Student 1 (PHPL) typically converges in ~750-1000 iterations; Student 2
+    # (VLP-UDA-style, learning its classifier_layer from scratch) wants far
+    # more -- VLP-UDA's own recipe uses 10000. Rather than force both onto one
+    # shared iteration count (either starving Student 2 or over-training
+    # Student 1 well past its usual sweet spot), each "macro-step" runs:
+    #   1. Snapshot BOTH teachers' current target-domain predictions BEFORE
+    #      either student updates this macro-step -- simulates running both
+    #      branches in parallel (matches MFA's own trainer.py: it queries
+    #      both mean_models before backward/step on EITHER optimizer, even
+    #      though MFA itself only ever runs both nets at the same 1:1 rate).
+    #   2. Student 2 runs --s2-per-s1 micro-iterations, EACH with its own
+    #      immediate EMA update (never batched/delayed) -- ALL of them using
+    #      the SAME snapshotted Teacher1 prediction from step 1 (Teacher1
+    #      truly hasn't changed meanwhile -- not an artificial cache).
+    #   3. Student 1 runs exactly 1 iteration, using the SAME snapshotted
+    #      Teacher2 prediction from step 1 (NOT Teacher2's post-burst state --
+    #      that would make Student 1 see the future relative to Student 2's
+    #      snapshot of Teacher1), then its own immediate EMA update.
+    parser.add_argument("--s1-total-iters", type=int, default=1000)
+    parser.add_argument("--s2-per-s1", type=int, default=10)
+    parser.add_argument("--print-freq", type=int, default=50, help="in macro-steps")
+    parser.add_argument("--eval-freq", type=int, default=200, help="in macro-steps")
 
     # Student 1 (PHPL-style) -- its own LoRA LR. Plain SGD, matching PHPL's
     # own recipe.
@@ -196,11 +215,15 @@ def main():
     # frozen teacher outright from epoch 2 on beat a beta-blend with it) and
     # replaced by each student's own (by-then-adapted) EMA teacher for self,
     # plus the other pair's teacher for cross.
-    parser.add_argument("--warmup-iters", type=int, default=200)
-    # Warmup LR is a separate, smaller CONSTANT (PHPL's own WARMUP_CONS_LR
-    # convention) for each of the 3 optimizers, not the main cosine schedule.
-    parser.add_argument("--s1-warmup-lr", type=float, default=1e-5)
-    parser.add_argument("--s2-lora-warmup-lr", type=float, default=1e-5)
+    # In macro-steps -- 100 for Student 1, which (at the default --s2-per-s1=10)
+    # naturally gives Student 2 exactly 1000 warmup micro-iterations too.
+    parser.add_argument("--warmup-iters", type=int, default=100)
+    # Warmup LR is a separate CONSTANT for each of the 3 optimizers, not the
+    # main cosine schedule -- 0.001, not PHPL's own literal WARMUP_CONS_LR
+    # (1e-5), per the user's own testing (1e-5 under-trained Teacher1 during
+    # warmup relative to a plain PHPL run).
+    parser.add_argument("--s1-warmup-lr", type=float, default=0.001)
+    parser.add_argument("--s2-lora-warmup-lr", type=float, default=0.001)
     # Unlike the two LoRA warmup LRs above, this one is NOT tiny -- the
     # classifier head starts near-random (not a good SVD-reconstructed point
     # like LoRA), so it needs to actually learn during warmup, not just "not
@@ -261,137 +284,166 @@ def main():
         optim2_head = torch.optim.SGD(student2_head.parameters(), lr=args.s2_clf_lr,
                                        momentum=0.9, nesterov=True, weight_decay=args.s2_clf_weight_decay)
 
-    # Cosine schedules span the POST-warmup budget only -- during warmup, LR
-    # is held at a separate constant instead (see the loop below), and the
-    # scheduler is never .step()'d until warmup ends.
-    post_warmup_iters = max(args.total_iters - args.warmup_iters, 1)
-    sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(optim1, T_max=post_warmup_iters)
-    sched2_backbone = torch.optim.lr_scheduler.CosineAnnealingLR(optim2_backbone, T_max=post_warmup_iters)
-    sched2_head = torch.optim.lr_scheduler.CosineAnnealingLR(optim2_head, T_max=post_warmup_iters)
+    s2_total_iters = args.s1_total_iters * args.s2_per_s1
+    s2_warmup_iters = args.warmup_iters * args.s2_per_s1
+    s1_post_warmup = max(args.s1_total_iters - args.warmup_iters, 1)
+    s2_post_warmup = max(s2_total_iters - s2_warmup_iters, 1)
+
+    # Cosine schedules span each student's OWN post-warmup budget -- during
+    # warmup, LR is held at a separate constant instead (see the loop below),
+    # and the scheduler is never .step()'d until warmup ends.
+    sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(optim1, T_max=s1_post_warmup)
+    sched2_backbone = torch.optim.lr_scheduler.CosineAnnealingLR(optim2_backbone, T_max=s2_post_warmup)
+    sched2_head = torch.optim.lr_scheduler.CosineAnnealingLR(optim2_head, T_max=s2_post_warmup)
 
     confi = cfg.TRAINER.PHPLMOMENTUM.CONFI
     best_acc1, best_acc2, best_acc_ens = 0.0, 0.0, 0.0
 
-    for it in range(args.total_iters):
-        batch_x = train_loader_x.next()
-        batch_u = train_loader_u.next()
-        image_x = batch_x["img"].to(device)
-        label_x = batch_x["label"].to(device)
-        image_u = batch_u["img"].to(device)
-        label_u = batch_u["label"].to(device)
+    def _masked_ce(logits, prob_ref):
+        max_probs, pseudo_label = torch.max(prob_ref, dim=-1)
+        mask = max_probs.ge(confi).float()
+        epsilon = 1e-8
+        return (F.cross_entropy(logits, pseudo_label, reduction="none") * mask).sum() / (mask.sum() + epsilon)
 
-        in_warmup = it < args.warmup_iters
+    def _task_distill(pred_own, pred_ref, lamb):
+        coe = _calibrated_coefficient(pred_own, pred_ref)
+        pred_mix = 0.5 * (pred_own + pred_ref)
+        task = args.lambda1 * lamb * _gini_impurity(pred_own, coe)
+        distill = args.lambda1 * lamb * _gini_impurity(pred_mix, 1 - coe)
+        return task + distill
 
-        # ---- source CE, both students ----
-        logits1_x, _ = student1(image_x)
-        loss_x1 = F.cross_entropy(logits1_x, label_x)
+    s2_it_global = 0
+    for macro in range(args.s1_total_iters):
+        in_warmup = macro < args.warmup_iters
 
-        _, feat2_x = student2_backbone(image_x)
-        logits2_x = student2_head(feat2_x.float())
-        loss_x2 = F.cross_entropy(logits2_x, label_x)
+        # ---- Student 1's own batch, used both for its own step below AND to
+        # snapshot Teacher2's cross-reference BEFORE Student 2's burst runs
+        # (simulates both branches running in parallel -- see the CLI help
+        # text above for --s1-total-iters). ----
+        batch_x1 = train_loader_x.next()
+        batch_u1 = train_loader_u.next()
+        image_x1 = batch_x1["img"].to(device)
+        label_x1 = batch_x1["label"].to(device)
+        image_u1 = batch_u1["img"].to(device)
 
-        def _masked_ce(logits, prob_ref):
-            max_probs, pseudo_label = torch.max(prob_ref, dim=-1)
-            mask = max_probs.ge(confi).float()
-            epsilon = 1e-8
-            return (F.cross_entropy(logits, pseudo_label, reduction="none") * mask).sum() / (mask.sum() + epsilon)
+        with torch.no_grad():
+            if in_warmup:
+                logits_cross_for_s1, _ = teacher_frozen(image_u1)
+            else:
+                _, feat_cross_for_s1 = teacher2_backbone(image_u1)
+                logits_cross_for_s1 = teacher2_head(feat_cross_for_s1.float())
+            prob_cross_for_s1 = F.softmax(logits_cross_for_s1, dim=-1)
 
-        logits1_u, _ = student1(image_u)
-        _, feat2_u = student2_backbone(image_u)
-        logits2_u = student2_head(feat2_u.float())
-        pred2_u = F.softmax(logits2_u, dim=1)
+        # ---- Student 2 burst: --s2-per-s1 micro-iterations, own immediate
+        # EMA update after EACH one -- Teacher1 is untouched throughout (it
+        # only updates after Student 1's single step below), so every
+        # micro-step here naturally uses the SAME Teacher1 snapshot. ----
+        for _ in range(args.s2_per_s1):
+            batch_x2 = train_loader_x.next()
+            batch_u2 = train_loader_u.next()
+            image_x2 = batch_x2["img"].to(device)
+            label_x2 = batch_x2["label"].to(device)
+            image_u2 = batch_u2["img"].to(device)
+
+            _, feat2_x2 = student2_backbone(image_x2)
+            logits2_x2 = student2_head(feat2_x2.float())
+            loss_x2 = F.cross_entropy(logits2_x2, label_x2)
+
+            _, feat2_u2 = student2_backbone(image_u2)
+            logits2_u2 = student2_head(feat2_u2.float())
+            pred2_u2 = F.softmax(logits2_u2, dim=1)
+
+            if in_warmup:
+                with torch.no_grad():
+                    logits_frozen_u2, _ = teacher_frozen(image_u2)
+                    prob_frozen_u2 = F.softmax(logits_frozen_u2, dim=-1)
+                loss_u2_self = args.lambda1 * (
+                    _gini_impurity(pred2_u2, _calibrated_coefficient(pred2_u2, prob_frozen_u2))
+                    + _gini_impurity(
+                        0.5 * (pred2_u2 + prob_frozen_u2),
+                        1 - _calibrated_coefficient(pred2_u2, prob_frozen_u2),
+                    )
+                )
+                loss_u2_cross = torch.tensor(0.0, device=device)
+                loss2 = loss_x2 + loss_u2_self
+                lamb = 1.0  # no ramp during warmup -- there's only one (frozen) reference
+            else:
+                with torch.no_grad():
+                    _, feat_self2 = teacher2_backbone(image_u2)
+                    prob_self2 = F.softmax(teacher2_head(feat_self2.float()), dim=-1)
+                    logits_t1_u2, _ = teacher1(image_u2)
+                    prob_cross2 = F.softmax(logits_t1_u2, dim=-1)
+
+                lamb = _cmkd_lamb(s2_it_global - s2_warmup_iters, s2_post_warmup, args.lamb_gamma)
+                loss_u2_self = _task_distill(pred2_u2, prob_self2, lamb)
+                loss_u2_cross = _task_distill(pred2_u2, prob_cross2, lamb)
+                loss2 = loss_x2 + loss_u2_self + args.cross_weight * loss_u2_cross
+
+            if in_warmup:
+                for pg in optim2_backbone.param_groups:
+                    pg["lr"] = args.s2_lora_warmup_lr
+                for pg in optim2_head.param_groups:
+                    pg["lr"] = args.s2_clf_warmup_lr
+
+            optim2_backbone.zero_grad()
+            optim2_head.zero_grad()
+            loss2.backward()
+            optim2_backbone.step()
+            optim2_head.step()
+            if not in_warmup:
+                sched2_backbone.step()
+                sched2_head.step()
+
+            _ema_update_lora_params(teacher2_backbone, student2_backbone, lambda k: args.ema_momentum)
+            head_momentum = 0.0 if s2_it_global < args.head_warmup_iters else args.head_ema_momentum
+            _ema_update_module(teacher2_head, student2_head, head_momentum)
+            s2_it_global += 1
+
+        # ---- Student 1's own step, using image_u1/prob_cross_for_s1 computed
+        # BEFORE the Student 2 burst above. ----
+        logits1_x, _ = student1(image_x1)
+        loss_x1 = F.cross_entropy(logits1_x, label_x1)
+        logits1_u, _ = student1(image_u1)
 
         if in_warmup:
-            # Single shared frozen reference, no self/cross split, no
-            # cross-teaching at all yet.
-            with torch.no_grad():
-                logits_frozen_u, _ = teacher_frozen(image_u)
-                prob_frozen_u = F.softmax(logits_frozen_u, dim=-1)
-
-            loss_u1_self = _masked_ce(logits1_u, prob_frozen_u)
+            loss_u1_self = _masked_ce(logits1_u, prob_cross_for_s1)
             loss_u1_cross = torch.tensor(0.0, device=device)
             loss1 = loss_x1 + loss_u1_self
-
-            coe = _calibrated_coefficient(pred2_u, prob_frozen_u)
-            pred_mix = 0.5 * (pred2_u + prob_frozen_u)
-            lamb = 1.0  # no ramp during warmup -- there's only one (frozen) reference
-            loss_u2_self = args.lambda1 * (
-                _gini_impurity(pred2_u, coe) + _gini_impurity(pred_mix, 1 - coe)
-            )
-            loss_u2_cross = torch.tensor(0.0, device=device)
-            loss2 = loss_x2 + loss_u2_self
         else:
-            # ---- both teachers' target-domain predictions (frozen, no_grad) ----
             with torch.no_grad():
-                logits_t1_u, _ = teacher1(image_u)
-                prob_t1_u = F.softmax(logits_t1_u, dim=-1)
-
-                _, feat_t2_u = teacher2_backbone(image_u)
-                logits_t2_u = teacher2_head(feat_t2_u.float())
-                prob_t2_u = F.softmax(logits_t2_u, dim=-1)
-
-            # ---- Student 1: self (Teacher1) + cross (Teacher2) ----
-            loss_u1_self = _masked_ce(logits1_u, prob_t1_u)
-            loss_u1_cross = _masked_ce(logits1_u, prob_t2_u)
+                logits_t1_self, _ = teacher1(image_u1)
+                prob_self1 = F.softmax(logits_t1_self, dim=-1)
+            loss_u1_self = _masked_ce(logits1_u, prob_self1)
+            loss_u1_cross = _masked_ce(logits1_u, prob_cross_for_s1)
             loss1 = loss_x1 + loss_u1_self + args.cross_weight * loss_u1_cross
-
-            # ---- Student 2: self (Teacher2) + cross (Teacher1) ----
-            lamb = _cmkd_lamb(it - args.warmup_iters, post_warmup_iters, args.lamb_gamma)
-
-            def _task_distill(pred_ref):
-                coe = _calibrated_coefficient(pred2_u, pred_ref)
-                pred_mix = 0.5 * (pred2_u + pred_ref)
-                task = args.lambda1 * lamb * _gini_impurity(pred2_u, coe)
-                distill = args.lambda1 * lamb * _gini_impurity(pred_mix, 1 - coe)
-                return task + distill
-
-            loss_u2_self = _task_distill(prob_t2_u)
-            loss_u2_cross = _task_distill(prob_t1_u)
-            loss2 = loss_x2 + loss_u2_self + args.cross_weight * loss_u2_cross
 
         if in_warmup:
             for pg in optim1.param_groups:
                 pg["lr"] = args.s1_warmup_lr
-            for pg in optim2_backbone.param_groups:
-                pg["lr"] = args.s2_lora_warmup_lr
-            for pg in optim2_head.param_groups:
-                pg["lr"] = args.s2_clf_warmup_lr
 
         optim1.zero_grad()
         loss1.backward()
         optim1.step()
-
-        optim2_backbone.zero_grad()
-        optim2_head.zero_grad()
-        loss2.backward()
-        optim2_backbone.step()
-        optim2_head.step()
-
         if not in_warmup:
             sched1.step()
-            sched2_backbone.step()
-            sched2_head.step()
 
         _ema_update_lora_params(teacher1, student1, lambda k: args.ema_momentum)
-        _ema_update_lora_params(teacher2_backbone, student2_backbone, lambda k: args.ema_momentum)
-        head_momentum = 0.0 if it < args.head_warmup_iters else args.head_ema_momentum
-        _ema_update_module(teacher2_head, student2_head, head_momentum)
 
-        if (it + 1) % args.print_freq == 0:
-            acc_x1 = (logits1_x.argmax(-1) == label_x).float().mean().item() * 100
-            acc_x2 = (logits2_x.argmax(-1) == label_x).float().mean().item() * 100
+        if (macro + 1) % args.print_freq == 0:
+            acc_x1 = (logits1_x.argmax(-1) == label_x1).float().mean().item() * 100
+            acc_x2 = (logits2_x2.argmax(-1) == label_x2).float().mean().item() * 100
             print(
-                f"iter [{it + 1}/{args.total_iters}] "
+                f"macro [{macro + 1}/{args.s1_total_iters}] (s2 iter {s2_it_global}/{s2_total_iters}) "
                 f"loss1 {loss1.item():.4f} (x {loss_x1.item():.4f} self {loss_u1_self.item():.4f} "
                 f"cross {loss_u1_cross.item():.4f}) acc_x1 {acc_x1:.2f} | "
                 f"loss2 {loss2.item():.4f} (x {loss_x2.item():.4f} self {loss_u2_self.item():.4f} "
                 f"cross {loss_u2_cross.item():.4f}) acc_x2 {acc_x2:.2f} lamb {lamb:.4f}"
             )
 
-        if (it + 1) % args.eval_freq == 0 or (it + 1) == args.total_iters or (it + 1) == args.warmup_iters:
+        if (macro + 1) % args.eval_freq == 0 or (macro + 1) == args.s1_total_iters or (macro + 1) == args.warmup_iters:
             acc1, acc2, acc_ens = evaluate(teacher1, teacher2_backbone, teacher2_head, test_loader, device)
-            tag = " [end of warmup]" if (it + 1) == args.warmup_iters else ""
-            print(f"[eval] iter {it + 1}{tag}: Teacher1 {acc1:.2f}% | Teacher2 {acc2:.2f}% | Ensemble {acc_ens:.2f}%")
+            tag = " [end of warmup]" if (macro + 1) == args.warmup_iters else ""
+            print(f"[eval] macro {macro + 1}{tag}: Teacher1 {acc1:.2f}% | Teacher2 {acc2:.2f}% | Ensemble {acc_ens:.2f}%")
 
             save_lora(cfg, lora1_t, osp.join(args.output_dir, "Teacher1"), filename="LoRA-last")
             torch.save(teacher2_backbone.state_dict(), osp.join(args.output_dir, "teacher2_backbone-last.pt"))
