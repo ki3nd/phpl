@@ -29,6 +29,10 @@ def get_parser():
 
     # network related
     parser.add_argument('--model_name', type=str, default='RN50', choices=["RN50", "VIT-B", "RN101"])
+    parser.add_argument('--init_from', type=str, default=None,
+                         help="sanity-check hook: path to a merged CLIP state_dict "
+                              "(see PHPL_momentum/export_merged_teacher.py) to load in "
+                              "place of the vanilla pretrained backbone")
 
     # data loading related
     parser.add_argument('--data_dir', type=str, required=True)
