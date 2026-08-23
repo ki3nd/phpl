@@ -26,12 +26,29 @@ import argparse
 import torch
 import torch.nn as nn
 
+from dassl.data import DataManager
+
 from utils.clip_part import load_clip_to_cpu
 from loralib.utils import apply_lora, apply_lora_rn, load_lora
 from loralib.layers import PlainMultiheadAttentionLoRA, LinearLoRA
 from trainers.da.phpl_momentum import _FrozenTeacherCLIP
 from train_cmkd import build_cfg
 import os.path as osp
+
+
+@torch.no_grad()
+def evaluate_cosine(model, test_loader, device):
+    """Plain zero-shot/cosine-similarity accuracy (model(image) -> logits,
+    feat), same metric phase 1 reports for teacher_now."""
+    model.eval()
+    correct, total = 0, 0
+    for batch in test_loader:
+        image = batch["img"].to(device)
+        label = batch["label"].to(device)
+        logits, _ = model(image)
+        correct += (logits.argmax(dim=-1) == label).sum().item()
+        total += label.size(0)
+    return 100.0 * correct / max(total, 1)
 
 
 def _merged_weight(proj):
@@ -94,23 +111,33 @@ def main():
     parser.add_argument("--phase1-checkpoint", choices=["last", "best"], default="last")
     parser.add_argument("--out", type=str, required=True, help="output .pt path for the merged CLIP state_dict")
 
+    parser.add_argument("--skip-eval", action="store_true",
+                         help="skip the before/after accuracy sanity check (faster, less safe)")
+
     args = parser.parse_args()
     cfg = build_cfg(args)
+    device = torch.device(f"cuda:{cfg.GPU}" if torch.cuda.is_available() else "cpu")
+
+    dm = DataManager(cfg)
+    classnames = dm.dataset.classnames
+    test_loader = dm.test_loader
 
     print(f"Loading TeacherNow checkpoint from {args.phase1_dir}")
     clip_model = load_clip_to_cpu(cfg)
     if cfg.TRAINER.PHPLMOMENTUM.PREC in ("fp32", "amp"):
         clip_model.float()
-    # classnames don't matter here -- only used for CUSTOM_TEMPLATES/tokenized
-    # prompts, which this export never touches.
-    dummy_classnames = ["x"]
-    teacher_now = _FrozenTeacherCLIP(cfg, dummy_classnames, clip_model)
+    teacher_now = _FrozenTeacherCLIP(cfg, classnames, clip_model)
 
     is_vit = cfg.MODEL.BACKBONE.NAME.split('-')[0] == 'ViT'
     apply_fn = apply_lora if is_vit else apply_lora_rn
     list_lora_layers = apply_fn(cfg, teacher_now)
     filename = "LoRA-last" if args.phase1_checkpoint == "last" else "LoRA-best"
     load_lora(cfg, list_lora_layers, osp.join(args.phase1_dir, "TeacherNow"), filename=filename)
+    teacher_now.to(device)
+
+    if not args.skip_eval:
+        acc_before = evaluate_cosine(teacher_now, test_loader, device)
+        print(f"[sanity] accuracy BEFORE merging LoRA: {acc_before:.2f}% (should match phase 1's own eval)")
 
     print(f"Merging LoRA into {len(list_lora_layers)} attention layers")
     # teacher_now.image_encoder IS clip_model.visual, and text_encoder.transformer
@@ -123,6 +150,12 @@ def main():
         1 for m in clip_model.modules() if isinstance(m, PlainMultiheadAttentionLoRA)
     )
     assert remaining == 0, f"{remaining} PlainMultiheadAttentionLoRA modules were not unwrapped"
+
+    if not args.skip_eval:
+        acc_after = evaluate_cosine(teacher_now, test_loader, device)
+        print(f"[sanity] accuracy AFTER merging LoRA:  {acc_after:.2f}% (should match the BEFORE value closely)")
+        if abs(acc_after - acc_before) > 0.5:
+            print("[sanity] WARNING: >0.5pp gap -- the merge likely has a bug, don't trust the exported checkpoint")
 
     torch.save(clip_model.state_dict(), args.out)
     print(f"Saved merged, plain CLIP state_dict to {args.out}")
