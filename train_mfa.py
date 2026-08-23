@@ -51,6 +51,8 @@ from torch.nn import functional as F
 from dassl.data import DataManager
 from dassl.utils import mkdir_if_missing, set_random_seed
 
+from utils.MK_MMD import MK_MMD
+
 from utils.clip_part import load_clip_to_cpu
 from loralib.utils import apply_lora, apply_lora_rn, save_lora
 from trainers.da.phpl_momentum import (
@@ -180,6 +182,11 @@ def main():
     parser.add_argument("--s1-lr", type=float, default=0.0035)
     parser.add_argument("--s1-momentum", type=float, default=0.9)
     parser.add_argument("--s1-weight-decay", type=float, default=5e-4)
+    # PHPL's own default (MMD_WEIGHT=1.0, always on) -- a domain-alignment
+    # term between Student1's source/target features, missing from the
+    # earlier version of this script entirely. Student 2 has no equivalent
+    # (VLP-UDA's own design doesn't include one).
+    parser.add_argument("--s1-mmd-weight", type=float, default=1.0)
 
     # Student 2 (VLP-UDA-style) -- TWO separate LRs (backbone LoRA vs
     # classifier head), same order of magnitude as Student 1's LoRA LR for
@@ -415,21 +422,25 @@ def main():
 
         # ---- Student 1's own step, using image_u1/prob_cross_for_s1 computed
         # BEFORE the Student 2 burst above. ----
-        logits1_x, _ = student1(image_x1)
+        logits1_x, feat_x1 = student1(image_x1)
         loss_x1 = F.cross_entropy(logits1_x, label_x1)
-        logits1_u, _ = student1(image_u1)
+        logits1_u, feat_u1 = student1(image_u1)
+        loss_mmd1 = MK_MMD(feat_x1, feat_u1)
 
         if in_warmup:
             loss_u1_self = _masked_ce(logits1_u, prob_cross_for_s1)
             loss_u1_cross = torch.tensor(0.0, device=device)
-            loss1 = loss_x1 + loss_u1_self
+            loss1 = loss_x1 + loss_u1_self + args.s1_mmd_weight * loss_mmd1
         else:
             with torch.no_grad():
                 logits_t1_self, _ = teacher1(image_u1)
                 prob_self1 = F.softmax(logits_t1_self, dim=-1)
             loss_u1_self = _masked_ce(logits1_u, prob_self1)
             loss_u1_cross = _masked_ce(logits1_u, prob_cross_for_s1)
-            loss1 = loss_x1 + loss_u1_self + args.cross_weight * loss_u1_cross
+            loss1 = (
+                loss_x1 + loss_u1_self + args.cross_weight * loss_u1_cross
+                + args.s1_mmd_weight * loss_mmd1
+            )
 
         if in_warmup:
             for pg in optim1.param_groups:
@@ -449,7 +460,7 @@ def main():
             print(
                 f"macro [{macro + 1}/{args.s1_total_iters}] (s2 iter {s2_it_global}/{s2_total_iters}) "
                 f"loss1 {loss1.item():.4f} (x {loss_x1.item():.4f} self {loss_u1_self.item():.4f} "
-                f"cross {loss_u1_cross.item():.4f}) acc_x1 {acc_x1:.2f} | "
+                f"cross {loss_u1_cross.item():.4f} mmd {loss_mmd1.item():.4f}) acc_x1 {acc_x1:.2f} | "
                 f"loss2 {loss2.item():.4f} (x {loss_x2.item():.4f} self {loss_u2_self.item():.4f} "
                 f"cross {loss_u2_cross.item():.4f}) acc_x2 {acc_x2:.2f} lamb {lamb:.4f}"
             )
