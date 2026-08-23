@@ -217,7 +217,13 @@ def main():
     parser.add_argument("--no-lamb-ramp", action="store_true",
                          help="skip the lamb ramp entirely -- lamb=1.0 for the whole post-warmup "
                               "run, so the entropy-min terms are just a constant lambda1 weight")
-    parser.add_argument("--cross-weight", type=float, default=1.0,
+    # MFA's own default ratio (TEMPORAL_CONSIST_WEIGHT=1.0 self / CROSS_MODEL_
+    # CONSIST_WEIGHT=0.5 cross) -- confirmed via a real training log that
+    # cross-teaching at full (1.0) weight drags whichever student is
+    # currently WEAKER down toward its stronger partner (a "rich get richer"
+    # dynamic MFA's own homogeneous two-net setup doesn't suffer from as
+    # badly, since both nets there tend to stay closely matched).
+    parser.add_argument("--cross-weight", type=float, default=0.5,
                          help="weight on BOTH students' cross-teaching loss term")
 
     # Warmup: both students train INDEPENDENTLY (no self/cross split, no
