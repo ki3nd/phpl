@@ -27,8 +27,11 @@ threshold at all -- continuous, weighted by the agreement coefficient, same
 as its "self" form.
 
 A flat, iteration-based loop (not Dassl's TrainerXU/BaseDA) -- see
-train_cmkd.py's own docstring for why. Source/target batches are SHARED
-between both students each iteration (matches MFA's own trainer.py).
+train_cmkd.py's own docstring for why. Student 1 and Student 2 train at
+DIFFERENT rates (see --s1-total-iters/--s2-per-s1 below), each pulling its
+own batches from the same underlying CyclingLoader stream -- NOT the same
+literal batch each step, unlike MFA's own trainer.py (which runs both nets
+1:1 and does share a batch); see the "macro-step" structure below for why.
 
 Usage:
     python train_mfa.py \\
@@ -109,7 +112,10 @@ def _build_lora_pair(cfg, is_vit, classnames, device):
 
 @torch.no_grad()
 def evaluate(teacher1, teacher2_backbone, teacher2_head, test_loader, device):
-    teacher2_head.eval()
+    """teacher2_head is expected to already be permanently in eval mode (set
+    once at construction, in main()) -- NOT toggled here, unlike a typical
+    eval() helper, since it must also run in eval mode as a reference DURING
+    training (see main()'s loop), not just here."""
     correct1, correct2, correct_ens, total = 0, 0, 0, 0
     for batch in test_loader:
         image = batch["img"].to(device)
@@ -128,7 +134,6 @@ def evaluate(teacher1, teacher2_backbone, teacher2_head, test_loader, device):
         correct2 += (prob2.argmax(dim=-1) == label).sum().item()
         correct_ens += (prob_ens.argmax(dim=-1) == label).sum().item()
         total += label.size(0)
-    teacher2_head.train()
     return (
         100.0 * correct1 / max(total, 1),
         100.0 * correct2 / max(total, 1),
@@ -261,6 +266,13 @@ def main():
     teacher2_head.load_state_dict(student2_head.state_dict())
     for param in teacher2_head.parameters():
         param.requires_grad_(False)
+    # Permanently in eval mode -- it's used as a frozen reference (self/cross)
+    # DURING training too (see the main loop below), not just at eval time.
+    # Left in .train() mode, its BatchNorm1d would normalize against each
+    # reference call's own batch statistics instead of stable running
+    # statistics, and would keep updating those running stats from every
+    # such call -- both wrong for something meant to be a stable teacher.
+    teacher2_head.eval()
 
     print("Building frozen zero-shot CLIP (warmup reference only)")
     clip_frozen = load_clip_to_cpu(cfg)
