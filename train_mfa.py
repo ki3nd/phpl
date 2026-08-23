@@ -199,7 +199,9 @@ def main():
                               "initialized head elsewhere in this project.")
 
     parser.add_argument("--lambda1", type=float, default=0.25, help="Student 2's CMKD task/distill weight")
-    parser.add_argument("--lamb-gamma", type=float, default=10.0, help="Student 2's lamb ramp gamma")
+    # VLP-UDA's own LambdaSheduler default -- lamb never reaches 1.0 with
+    # this (maxes out at ~0.46, at the very end of training).
+    parser.add_argument("--lamb-gamma", type=float, default=1.0, help="Student 2's lamb ramp gamma")
     parser.add_argument("--cross-weight", type=float, default=1.0,
                          help="weight on BOTH students' cross-teaching loss term")
 
