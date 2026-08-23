@@ -448,6 +448,11 @@ def main():
 
         optim1.zero_grad()
         loss1.backward()
+        # PHPL's own model_backward_and_update_with_gradient_monitoring always
+        # clips to max_norm=20.0 (trainers/baseda.py) -- missing here before.
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in student1.parameters() if p.requires_grad], max_norm=20.0
+        )
         optim1.step()
         if not in_warmup:
             sched1.step()
