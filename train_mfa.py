@@ -228,8 +228,10 @@ def main():
     # currently WEAKER down toward its stronger partner (a "rich get richer"
     # dynamic MFA's own homogeneous two-net setup doesn't suffer from as
     # badly, since both nets there tend to stay closely matched).
-    parser.add_argument("--cross-weight", type=float, default=0.5,
-                         help="weight on BOTH students' cross-teaching loss term")
+    parser.add_argument("--s1-cross-weight", type=float, default=0.5,
+                         help="weight on Student 1's cross-teaching loss term")
+    parser.add_argument("--s2-cross-weight", type=float, default=0.5,
+                         help="weight on Student 2's cross-teaching loss term")
     parser.add_argument("--s2-cross-mode", choices=["mask", "gini"], default="mask",
                          help="Student 2's cross-teaching mechanism: 'mask' = Student1-style "
                               "CONFI hard-threshold mask + CE (current default); 'gini' = CMKD's "
@@ -450,7 +452,7 @@ def main():
                     + args.lambda3 * lamb * _gini_impurity(pred_self2_clip_live)
                 )
 
-                loss2 = loss_x2 + loss_u2_self + args.cross_weight * loss_u2_cross + reg_loss
+                loss2 = loss_x2 + loss_u2_self + args.s2_cross_weight * loss_u2_cross + reg_loss
 
             if in_warmup:
                 for pg in optim2_backbone.param_groups:
@@ -490,7 +492,7 @@ def main():
             loss_u1_self = _masked_ce(logits1_u, prob_self1)
             loss_u1_cross = _masked_ce(logits1_u, prob_cross_for_s1)
             loss1 = (
-                loss_x1 + loss_u1_self + args.cross_weight * loss_u1_cross
+                loss_x1 + loss_u1_self + args.s1_cross_weight * loss_u1_cross
                 + args.s1_mmd_weight * loss_mmd1
             )
 
