@@ -196,7 +196,12 @@ def main():
     # convention) for each of the 3 optimizers, not the main cosine schedule.
     parser.add_argument("--s1-warmup-lr", type=float, default=1e-5)
     parser.add_argument("--s2-lora-warmup-lr", type=float, default=1e-5)
-    parser.add_argument("--s2-clf-warmup-lr", type=float, default=1e-5)
+    # Unlike the two LoRA warmup LRs above, this one is NOT tiny -- the
+    # classifier head starts near-random (not a good SVD-reconstructed point
+    # like LoRA), so it needs to actually learn during warmup, not just "not
+    # move much". Defaults to the same value as --s2-clf-lr (no separate
+    # suppression during warmup).
+    parser.add_argument("--s2-clf-warmup-lr", type=float, default=0.003)
 
     args = parser.parse_args()
     cfg = build_cfg(args)
