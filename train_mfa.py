@@ -225,6 +225,14 @@ def main():
     # badly, since both nets there tend to stay closely matched).
     parser.add_argument("--cross-weight", type=float, default=0.5,
                          help="weight on BOTH students' cross-teaching loss term")
+    parser.add_argument("--s2-cross-mode", choices=["mask", "gini"], default="mask",
+                         help="Student 2's cross-teaching mechanism: 'mask' = Student1-style "
+                              "CONFI hard-threshold mask + CE (current default); 'gini' = CMKD's "
+                              "own task/distill gini-impurity formula (same as Student 2's self "
+                              "loss), using Teacher1's prediction as the reference -- Teacher1's "
+                              "cosine-similarity branch is naturally sharp (logit_scale~100), so "
+                              "it fits the sharp-reference role CMKD's calibrated_coefficient "
+                              "expects.")
 
     # Warmup: both students train INDEPENDENTLY (no self/cross split, no
     # cross-teaching at all) against a single shared FROZEN zero-shot CLIP
@@ -409,16 +417,14 @@ def main():
                 else:
                     lamb = _cmkd_lamb(s2_it_global - s2_warmup_iters, s2_post_warmup, args.lamb_gamma)
                 loss_u2_self = _task_distill(pred2_u2, prob_self2, lamb)
-                # Cross uses Student1's own mechanism (CONFI=0.85 hard-threshold
-                # mask + CE) instead of gini/coe -- Teacher1's cosine-similarity
-                # branch is far SHARPER than Teacher2's (CLIP's logit_scale~100
-                # vs classifier_layer's plain, unscaled logits), so calibrated_
-                # coefficient's KL-based agreement collapsed to ~0 whenever
-                # Student2 (naturally softer) didn't already near-exactly match
-                # Teacher1's near-one-hot prediction -- inflating distill_loss
-                # (weighted by 1-coe) to dominate almost every step, confirmed
-                # via a real training log (cross loss consistently >> self loss).
-                loss_u2_cross = _masked_ce(logits2_u2, prob_cross2)
+                if args.s2_cross_mode == "gini":
+                    # CMKD's own task/distill formula, same as self, but with
+                    # Teacher1 (naturally sharp -- logit_scale~100) as the
+                    # reference instead of Teacher2's own EMA.
+                    loss_u2_cross = _task_distill(pred2_u2, prob_cross2, lamb)
+                else:
+                    # Student1-style CONFI=0.85 hard-threshold mask + CE.
+                    loss_u2_cross = _masked_ce(logits2_u2, prob_cross2)
                 loss2 = loss_x2 + loss_u2_self + args.cross_weight * loss_u2_cross
 
             if in_warmup:
