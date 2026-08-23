@@ -214,6 +214,9 @@ def main():
     # VLP-UDA's own LambdaSheduler default -- lamb never reaches 1.0 with
     # this (maxes out at ~0.46, at the very end of training).
     parser.add_argument("--lamb-gamma", type=float, default=1.0, help="Student 2's lamb ramp gamma")
+    parser.add_argument("--no-lamb-ramp", action="store_true",
+                         help="skip the lamb ramp entirely -- lamb=1.0 for the whole post-warmup "
+                              "run, so the entropy-min terms are just a constant lambda1 weight")
     parser.add_argument("--cross-weight", type=float, default=1.0,
                          help="weight on BOTH students' cross-teaching loss term")
 
@@ -395,7 +398,10 @@ def main():
                     logits_t1_u2, _ = teacher1(image_u2)
                     prob_cross2 = F.softmax(logits_t1_u2, dim=-1)
 
-                lamb = _cmkd_lamb(s2_it_global - s2_warmup_iters, s2_post_warmup, args.lamb_gamma)
+                if args.no_lamb_ramp:
+                    lamb = 1.0
+                else:
+                    lamb = _cmkd_lamb(s2_it_global - s2_warmup_iters, s2_post_warmup, args.lamb_gamma)
                 loss_u2_self = _task_distill(pred2_u2, prob_self2, lamb)
                 loss_u2_cross = _task_distill(pred2_u2, prob_cross2, lamb)
                 loss2 = loss_x2 + loss_u2_self + args.cross_weight * loss_u2_cross
