@@ -59,10 +59,15 @@ from train_cmkd import build_cfg, CyclingLoader, _gini_impurity, _calibrated_coe
 @torch.no_grad()
 def _ema_update_module(ema_module, src_module, momentum):
     """Generic parameter+buffer-wise EMA for a plain nn.Module (Student 2's
-    classifier head isn't LoRA, so _ema_update_lora_params doesn't apply)."""
+    classifier head isn't LoRA, so _ema_update_lora_params doesn't apply).
+    BatchNorm1d's state_dict includes num_batches_tracked, a Long counter --
+    not a learned value, can't take a float EMA -- hard-copied instead."""
     ema_state = ema_module.state_dict()
     for k, v in src_module.state_dict().items():
-        ema_state[k].mul_(momentum).add_(v, alpha=1.0 - momentum)
+        if not torch.is_floating_point(v):
+            ema_state[k].copy_(v)
+        else:
+            ema_state[k].mul_(momentum).add_(v, alpha=1.0 - momentum)
 
 
 def _cmkd_lamb(cur_iter, max_iter, gamma):
