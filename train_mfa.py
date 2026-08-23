@@ -378,9 +378,10 @@ def main():
                 f"cross {loss_u2_cross.item():.4f}) acc_x2 {acc_x2:.2f} lamb {lamb:.4f}"
             )
 
-        if (it + 1) % args.eval_freq == 0 or (it + 1) == args.total_iters:
+        if (it + 1) % args.eval_freq == 0 or (it + 1) == args.total_iters or (it + 1) == args.warmup_iters:
             acc1, acc2, acc_ens = evaluate(teacher1, teacher2_backbone, teacher2_head, test_loader, device)
-            print(f"[eval] iter {it + 1}: Teacher1 {acc1:.2f}% | Teacher2 {acc2:.2f}% | Ensemble {acc_ens:.2f}%")
+            tag = " [end of warmup]" if (it + 1) == args.warmup_iters else ""
+            print(f"[eval] iter {it + 1}{tag}: Teacher1 {acc1:.2f}% | Teacher2 {acc2:.2f}% | Ensemble {acc_ens:.2f}%")
 
             save_lora(cfg, lora1_t, osp.join(args.output_dir, "Teacher1"), filename="LoRA-last")
             torch.save(teacher2_backbone.state_dict(), osp.join(args.output_dir, "teacher2_backbone-last.pt"))
