@@ -179,6 +179,25 @@ def main():
     parser.add_argument("--cross-weight", type=float, default=1.0,
                          help="weight on BOTH students' cross-teaching loss term")
 
+    # Warmup: both students train INDEPENDENTLY (no self/cross split, no
+    # cross-teaching at all) against a single shared FROZEN zero-shot CLIP
+    # (no LoRA) for this many iterations first -- at iteration 0, neither
+    # Teacher1 nor Teacher2 has anything meaningful to teach yet (Teacher2's
+    # classifier head starts genuinely random), so bootstrapping from a
+    # stable, always-reasonable frozen reference avoids each student
+    # poisoning the other via cross-teaching before either is ready. AFTER
+    # warmup, this frozen reference is dropped ENTIRELY (not blended in,
+    # confirmed by prior experimentation on the PHPL branch: dropping the
+    # frozen teacher outright from epoch 2 on beat a beta-blend with it) and
+    # replaced by each student's own (by-then-adapted) EMA teacher for self,
+    # plus the other pair's teacher for cross.
+    parser.add_argument("--warmup-iters", type=int, default=200)
+    # Warmup LR is a separate, smaller CONSTANT (PHPL's own WARMUP_CONS_LR
+    # convention) for each of the 3 optimizers, not the main cosine schedule.
+    parser.add_argument("--s1-warmup-lr", type=float, default=1e-5)
+    parser.add_argument("--s2-lora-warmup-lr", type=float, default=1e-5)
+    parser.add_argument("--s2-clf-warmup-lr", type=float, default=1e-5)
+
     args = parser.parse_args()
     cfg = build_cfg(args)
     device = torch.device(f"cuda:{cfg.GPU}" if torch.cuda.is_available() else "cpu")
@@ -208,6 +227,15 @@ def main():
     for param in teacher2_head.parameters():
         param.requires_grad_(False)
 
+    print("Building frozen zero-shot CLIP (warmup reference only)")
+    clip_frozen = load_clip_to_cpu(cfg)
+    if cfg.TRAINER.PHPLMOMENTUM.PREC in ("fp32", "amp"):
+        clip_frozen.float()
+    teacher_frozen = _FrozenTeacherCLIP(cfg, classnames, clip_frozen).to(device)
+    for param in teacher_frozen.parameters():
+        param.requires_grad_(False)
+    teacher_frozen.eval()
+
     optim1 = torch.optim.SGD(
         [p for p in student1.parameters() if p.requires_grad],
         lr=args.s1_lr, momentum=args.s1_momentum, weight_decay=args.s1_weight_decay,
@@ -223,9 +251,13 @@ def main():
         optim2_head = torch.optim.SGD(student2_head.parameters(), lr=args.s2_clf_lr,
                                        momentum=0.9, nesterov=True, weight_decay=args.s2_clf_weight_decay)
 
-    sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(optim1, T_max=args.total_iters)
-    sched2_backbone = torch.optim.lr_scheduler.CosineAnnealingLR(optim2_backbone, T_max=args.total_iters)
-    sched2_head = torch.optim.lr_scheduler.CosineAnnealingLR(optim2_head, T_max=args.total_iters)
+    # Cosine schedules span the POST-warmup budget only -- during warmup, LR
+    # is held at a separate constant instead (see the loop below), and the
+    # scheduler is never .step()'d until warmup ends.
+    post_warmup_iters = max(args.total_iters - args.warmup_iters, 1)
+    sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(optim1, T_max=post_warmup_iters)
+    sched2_backbone = torch.optim.lr_scheduler.CosineAnnealingLR(optim2_backbone, T_max=post_warmup_iters)
+    sched2_head = torch.optim.lr_scheduler.CosineAnnealingLR(optim2_head, T_max=post_warmup_iters)
 
     confi = cfg.TRAINER.PHPLMOMENTUM.CONFI
     best_acc1, best_acc2, best_acc_ens = 0.0, 0.0, 0.0
@@ -238,6 +270,8 @@ def main():
         image_u = batch_u["img"].to(device)
         label_u = batch_u["label"].to(device)
 
+        in_warmup = it < args.warmup_iters
+
         # ---- source CE, both students ----
         logits1_x, _ = student1(image_x)
         loss_x1 = F.cross_entropy(logits1_x, label_x)
@@ -246,57 +280,87 @@ def main():
         logits2_x = student2_head(feat2_x.float())
         loss_x2 = F.cross_entropy(logits2_x, label_x)
 
-        # ---- both teachers' target-domain predictions (frozen, no_grad) ----
-        with torch.no_grad():
-            logits_t1_u, _ = teacher1(image_u)
-            prob_t1_u = F.softmax(logits_t1_u, dim=-1)
-
-            _, feat_t2_u = teacher2_backbone(image_u)
-            logits_t2_u = teacher2_head(feat_t2_u.float())
-            prob_t2_u = F.softmax(logits_t2_u, dim=-1)
-
-        # ---- Student 1 target-domain loss: self (Teacher1) + cross (Teacher2) ----
-        logits1_u, _ = student1(image_u)
-
         def _masked_ce(logits, prob_ref):
             max_probs, pseudo_label = torch.max(prob_ref, dim=-1)
             mask = max_probs.ge(confi).float()
             epsilon = 1e-8
             return (F.cross_entropy(logits, pseudo_label, reduction="none") * mask).sum() / (mask.sum() + epsilon)
 
-        loss_u1_self = _masked_ce(logits1_u, prob_t1_u)
-        loss_u1_cross = _masked_ce(logits1_u, prob_t2_u)
-        loss1 = loss_x1 + loss_u1_self + args.cross_weight * loss_u1_cross
-
-        # ---- Student 2 target-domain loss: self (Teacher2) + cross (Teacher1) ----
+        logits1_u, _ = student1(image_u)
         _, feat2_u = student2_backbone(image_u)
         logits2_u = student2_head(feat2_u.float())
         pred2_u = F.softmax(logits2_u, dim=1)
-        lamb = _cmkd_lamb(it, args.total_iters, args.lamb_gamma)
 
-        def _task_distill(pred_ref):
-            coe = _calibrated_coefficient(pred2_u, pred_ref)
-            pred_mix = 0.5 * (pred2_u + pred_ref)
-            task = args.lambda1 * lamb * _gini_impurity(pred2_u, coe)
-            distill = args.lambda1 * lamb * _gini_impurity(pred_mix, 1 - coe)
-            return task + distill
+        if in_warmup:
+            # Single shared frozen reference, no self/cross split, no
+            # cross-teaching at all yet.
+            with torch.no_grad():
+                logits_frozen_u, _ = teacher_frozen(image_u)
+                prob_frozen_u = F.softmax(logits_frozen_u, dim=-1)
 
-        loss_u2_self = _task_distill(prob_t2_u)
-        loss_u2_cross = _task_distill(prob_t1_u)
-        loss2 = loss_x2 + loss_u2_self + args.cross_weight * loss_u2_cross
+            loss_u1_self = _masked_ce(logits1_u, prob_frozen_u)
+            loss_u1_cross = torch.tensor(0.0, device=device)
+            loss1 = loss_x1 + loss_u1_self
+
+            coe = _calibrated_coefficient(pred2_u, prob_frozen_u)
+            pred_mix = 0.5 * (pred2_u + prob_frozen_u)
+            lamb = 1.0  # no ramp during warmup -- there's only one (frozen) reference
+            loss_u2_self = args.lambda1 * (
+                _gini_impurity(pred2_u, coe) + _gini_impurity(pred_mix, 1 - coe)
+            )
+            loss_u2_cross = torch.tensor(0.0, device=device)
+            loss2 = loss_x2 + loss_u2_self
+        else:
+            # ---- both teachers' target-domain predictions (frozen, no_grad) ----
+            with torch.no_grad():
+                logits_t1_u, _ = teacher1(image_u)
+                prob_t1_u = F.softmax(logits_t1_u, dim=-1)
+
+                _, feat_t2_u = teacher2_backbone(image_u)
+                logits_t2_u = teacher2_head(feat_t2_u.float())
+                prob_t2_u = F.softmax(logits_t2_u, dim=-1)
+
+            # ---- Student 1: self (Teacher1) + cross (Teacher2) ----
+            loss_u1_self = _masked_ce(logits1_u, prob_t1_u)
+            loss_u1_cross = _masked_ce(logits1_u, prob_t2_u)
+            loss1 = loss_x1 + loss_u1_self + args.cross_weight * loss_u1_cross
+
+            # ---- Student 2: self (Teacher2) + cross (Teacher1) ----
+            lamb = _cmkd_lamb(it - args.warmup_iters, post_warmup_iters, args.lamb_gamma)
+
+            def _task_distill(pred_ref):
+                coe = _calibrated_coefficient(pred2_u, pred_ref)
+                pred_mix = 0.5 * (pred2_u + pred_ref)
+                task = args.lambda1 * lamb * _gini_impurity(pred2_u, coe)
+                distill = args.lambda1 * lamb * _gini_impurity(pred_mix, 1 - coe)
+                return task + distill
+
+            loss_u2_self = _task_distill(prob_t2_u)
+            loss_u2_cross = _task_distill(prob_t1_u)
+            loss2 = loss_x2 + loss_u2_self + args.cross_weight * loss_u2_cross
+
+        if in_warmup:
+            for pg in optim1.param_groups:
+                pg["lr"] = args.s1_warmup_lr
+            for pg in optim2_backbone.param_groups:
+                pg["lr"] = args.s2_lora_warmup_lr
+            for pg in optim2_head.param_groups:
+                pg["lr"] = args.s2_clf_warmup_lr
 
         optim1.zero_grad()
         loss1.backward()
         optim1.step()
-        sched1.step()
 
         optim2_backbone.zero_grad()
         optim2_head.zero_grad()
         loss2.backward()
         optim2_backbone.step()
         optim2_head.step()
-        sched2_backbone.step()
-        sched2_head.step()
+
+        if not in_warmup:
+            sched1.step()
+            sched2_backbone.step()
+            sched2_head.step()
 
         _ema_update_lora_params(teacher1, student1, lambda k: args.ema_momentum)
         _ema_update_lora_params(teacher2_backbone, student2_backbone, lambda k: args.ema_momentum)
