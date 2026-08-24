@@ -287,6 +287,14 @@ def main():
                               "run, so the entropy-min terms are just a constant lambda1 weight")
     parser.add_argument("--s2-cross-weight", type=float, default=0.5,
                          help="weight on Student 2's cross-teaching loss term")
+    parser.add_argument("--s2-self-from-student", action="store_true",
+                         help="self-loss reference is student2_backbone's OWN live cosine branch "
+                              "(detached) instead of Teacher2's EMA -- matches pure VLP-UDA's real "
+                              "design exactly (models/cmkd.py + make_model.py: self.teacher_model "
+                              "is declared but never used in forward(), only for --rst checkpoint "
+                              "saving). Off by default (Teacher2 EMA reference, current behavior). "
+                              "Teacher2's own EMA update still runs either way -- this only changes "
+                              "which one feeds the self-loss.")
     parser.add_argument("--s2-cross-mode", choices=["mask", "gini"], default="mask",
                          help="Student 2's cross-teaching mechanism: 'mask' = Student1-style "
                               "CONFI hard-threshold mask + CE (current default); 'gini' = CMKD's "
@@ -478,9 +486,14 @@ def main():
             # reg_loss still trains student2_backbone's OWN cosine branch
             # directly (pred_self2_clip_live, undetached) -- unaffected.
             pred_self2_clip_live = F.softmax(logits2_u2_clip, dim=-1)
-            with torch.no_grad():
-                logits_self2_teacher, _ = teacher2_backbone(image_u2)
-                prob_self2 = F.softmax(logits_self2_teacher, dim=-1)
+            if args.s2_self_from_student:
+                # --s2-self-from-student: matches pure VLP-UDA exactly (no
+                # teacher/EMA involved in self-training at all).
+                prob_self2 = pred_self2_clip_live.detach()
+            else:
+                with torch.no_grad():
+                    logits_self2_teacher, _ = teacher2_backbone(image_u2)
+                    prob_self2 = F.softmax(logits_self2_teacher, dim=-1)
 
             # Continuous ramp across the WHOLE run (including warmup) from
             # iteration 0, matching VLP-UDA's own LambdaSheduler -- no reset
