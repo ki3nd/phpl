@@ -154,19 +154,30 @@ from loralib.utils import apply_lora, apply_lora_rn, save_lora, load_lora
 
 
 class CustomCLIP(Base_CustomCLIP):
-    """Same as Base_CustomCLIP.forward, but also returns image_features (needed for MK-MMD)."""
+    """Same as Base_CustomCLIP.forward, but also returns image_features (needed for MK-MMD).
 
-    def forward(self, image):
+    normalize_feat controls ONLY the second (image_features) return value --
+    logits always use the L2-normalized feature internally (that's what
+    cosine-similarity classification requires), regardless of this flag.
+    Default True preserves every existing call site's behavior unchanged
+    (Student1/Teacher1's own cosine-similarity design wants the normalized
+    feature for MK-MMD). Student2 (train_mfa.py) passes False to get the
+    RAW feature its classifier_layer-style head expects -- VLP-UDA's own
+    classifier_layer (models/make_model.py's forward_features) is fed the
+    backbone's raw output, never normalized (only its separate cosine
+    branch, forward_head, normalizes)."""
+
+    def forward(self, image, normalize_feat=True):
         text_features = self.text_encoder(self.tokenized_prompts.to(self.logit_scale.device))
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
         image_features = self.image_encoder(image.type(self.dtype))
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        image_features_norm = image_features / image_features.norm(dim=-1, keepdim=True)
 
         logit_scale = self.logit_scale.exp()
-        logits = logit_scale * image_features @ text_features.t()
+        logits = logit_scale * image_features_norm @ text_features.t()
 
-        return logits, image_features
+        return logits, (image_features_norm if normalize_feat else image_features)
 
 
 class _FrozenTeacherCLIP(CustomCLIP):

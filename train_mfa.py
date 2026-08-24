@@ -193,7 +193,7 @@ def evaluate(teacher1, teacher2_backbone, teacher2_head, test_loader, device):
         logits1, _ = teacher1(image)
         prob1 = F.softmax(logits1, dim=-1)
 
-        _, feat2 = teacher2_backbone(image)
+        _, feat2 = teacher2_backbone(image, normalize_feat=False)
         logits2 = teacher2_head(feat2.float())
         prob2 = F.softmax(logits2, dim=-1)
 
@@ -477,7 +477,7 @@ def main():
             if in_warmup:
                 logits_cross_for_s1, _ = teacher_frozen(image_u1)
             else:
-                _, feat_cross_for_s1 = teacher2_backbone(image_u1)
+                _, feat_cross_for_s1 = teacher2_backbone(image_u1, normalize_feat=False)
                 logits_cross_for_s1 = teacher2_head(feat_cross_for_s1.float())
             prob_cross_for_s1 = F.softmax(logits_cross_for_s1, dim=-1)
 
@@ -492,13 +492,13 @@ def main():
             label_x2 = batch_x2["label"].to(device)
             image_u2 = batch_u2["img"].to(device)
 
-            logits2_x2_clip, feat2_x2 = student2_backbone(image_x2)
+            logits2_x2_clip, feat2_x2 = student2_backbone(image_x2, normalize_feat=False)
             logits2_x2 = student2_head(feat2_x2.float())
             # label_smoothing matches VLP-UDA's own clf_loss -- applies ONLY
             # to this classifier CE, not reg_loss's cosine-branch CE below.
             loss_x2 = F.cross_entropy(logits2_x2, label_x2, label_smoothing=args.s2_label_smoothing)
 
-            logits2_u2_clip, feat2_u2 = student2_backbone(image_u2)
+            logits2_u2_clip, feat2_u2 = student2_backbone(image_u2, normalize_feat=False)
             logits2_u2 = student2_head(feat2_u2.float())
             pred2_u2 = F.softmax(logits2_u2, dim=1)
 
