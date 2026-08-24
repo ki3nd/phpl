@@ -377,15 +377,32 @@ def main():
             ToTensor(),
             normalize,
         ])
-        dm = DataManager(cfg, custom_tfm_train=tfm_train, custom_tfm_test=tfm_test)
+        dm_kwargs = dict(custom_tfm_train=tfm_train, custom_tfm_test=tfm_test)
     else:
-        dm = DataManager(cfg)
-    train_loader_x = CyclingLoader(dm.train_loader_x)
-    train_loader_u = CyclingLoader(dm.train_loader_u)
-    test_loader = dm.test_loader
-    classnames = dm.dataset.classnames
-    num_classes = dm.num_classes
+        dm_kwargs = {}
+
+    # Each branch gets its OWN DataManager/loader pair -- same augmentation
+    # config for both (dm_kwargs), but genuinely independent shuffled
+    # streams. Previously both branches shared ONE CyclingLoader pair:
+    # every macro-step drew 1 batch for Student1 then 10 for Student2's
+    # burst from the SAME underlying iterator, so within any one lap
+    # Student1 only ever saw 1/11 of the batches drawn (the other 10 were
+    # "used up" by Student2, not skipped due to a bug, just literally
+    # consumed by whoever called .next() first) -- a real, non-obvious
+    # difference from either branch running with its own independent
+    # per-epoch shuffle (as a truly standalone run, e.g. pure VLP-UDA,
+    # would have).
+    dm1 = DataManager(cfg, **dm_kwargs)
+    train_loader_x1 = CyclingLoader(dm1.train_loader_x)
+    train_loader_u1 = CyclingLoader(dm1.train_loader_u)
+    test_loader = dm1.test_loader
+    classnames = dm1.dataset.classnames
+    num_classes = dm1.num_classes
     is_vit = cfg.MODEL.BACKBONE.NAME.split('-')[0] == 'ViT'
+
+    dm2 = DataManager(cfg, **dm_kwargs)
+    train_loader_x2 = CyclingLoader(dm2.train_loader_x)
+    train_loader_u2 = CyclingLoader(dm2.train_loader_u)
 
     print("Building Student1/Teacher1 (PHPL-style)")
     student1, teacher1, lora1_s, lora1_t = _build_lora_pair(cfg, is_vit, classnames, device)
@@ -467,8 +484,8 @@ def main():
         # snapshot Teacher2's cross-reference BEFORE Student 2's burst runs
         # (simulates both branches running in parallel -- see the CLI help
         # text above for --s1-total-iters). ----
-        batch_x1 = train_loader_x.next()
-        batch_u1 = train_loader_u.next()
+        batch_x1 = train_loader_x1.next()
+        batch_u1 = train_loader_u1.next()
         image_x1 = batch_x1["img"].to(device)
         label_x1 = batch_x1["label"].to(device)
         image_u1 = batch_u1["img"].to(device)
@@ -486,8 +503,8 @@ def main():
         # only updates after Student 1's single step below), so every
         # micro-step here naturally uses the SAME Teacher1 snapshot. ----
         for _ in range(args.s2_per_s1):
-            batch_x2 = train_loader_x.next()
-            batch_u2 = train_loader_u.next()
+            batch_x2 = train_loader_x2.next()
+            batch_u2 = train_loader_u2.next()
             image_x2 = batch_x2["img"].to(device)
             label_x2 = batch_x2["label"].to(device)
             image_u2 = batch_u2["img"].to(device)
