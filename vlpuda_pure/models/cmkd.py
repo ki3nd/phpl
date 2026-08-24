@@ -29,11 +29,20 @@ class CMKD(nn.Module):
         return self.args.lambda2*F.cross_entropy(source_logit_clip, source_label) + \
             self.args.lambda3*lamb*self.gini_impurity(target_pred_clip)
 
-    def forward(self, target_logit, target_logit_clip, source_logit_clip, source_label, label_set=None):
+    def forward(self, target_logit, target_logit_clip, source_logit_clip, source_label, label_set=None,
+                self_ref_logit_clip=None):
+        # self_ref_logit_clip: optional, SEPARATE reference for the self-
+        # consistency terms (coe/mix) only -- reg_loss below always uses
+        # target_pred_clip (from target_logit_clip), so it keeps training
+        # the LIVE cosine branch regardless of what self-reference is used.
+        # Defaults to target_logit_clip itself, i.e. the original behavior
+        # (own live cosine branch as its own self-reference) when omitted.
         target_pred = F.softmax(target_logit, dim=1)
         target_pred_clip = F.softmax(target_logit_clip,dim=-1)
-        coe = self.calibrated_coefficient(target_pred, target_pred_clip)
-        target_pred_mix = 0.5*(target_pred+target_pred_clip.detach())
+        self_ref_clip = target_logit_clip if self_ref_logit_clip is None else self_ref_logit_clip
+        target_pred_self_ref = F.softmax(self_ref_clip, dim=-1)
+        coe = self.calibrated_coefficient(target_pred, target_pred_self_ref)
+        target_pred_mix = 0.5*(target_pred+target_pred_self_ref.detach())
         lamb = self.lamb.lamb()
         if label_set is not None:
             task_loss = self.args.lambda1 * lamb * self.gini_impurity(target_pred[:,label_set], coe)

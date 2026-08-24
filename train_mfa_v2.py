@@ -17,10 +17,14 @@ DataManager. Student 2 / Teacher 2 now:
   - Model: vlpuda_pure's own TransferNet (CLIP ViT-B/16 backbone finetuned
     directly, no LoRA, same as train_mfa.py's design -- but here it's
     their actual class, not a reimplementation).
-  - Self-loss: TransferNet.forward()'s own (clf_loss, transfer_loss) --
-    called AS-IS, untouched. This already IS VLP-UDA's real CMKD self-
-    training (no teacher/EMA involved at all in this loss, by design --
-    see cmkd.py).
+  - Self-loss: TransferNet.forward()'s own (clf_loss, transfer_loss). By
+    default this already IS VLP-UDA's real CMKD self-training (no
+    teacher/EMA involved in the self-consistency reference at all, by
+    design -- see cmkd.py). --s2-self-from-teacher swaps that reference to
+    Teacher2's EMA cosine branch instead (make_model.py/cmkd.py gained an
+    optional self_ref_logit_clip param for this, default None preserving
+    the original behavior exactly) -- reg_loss's entropy-min term still
+    always uses the LIVE cosine branch regardless, so it keeps training it.
   - Cross-loss (Teacher1 -> Student2, Teacher2 -> Student1): NOT part of
     CMKD -- added on top here, same mechanism as train_mfa.py (CONFI
     hard-threshold mask + CE, --s2-cross-mode mask/gini).
@@ -255,6 +259,14 @@ def main():
                          help="weight on Student 2's cross-teaching loss term "
                               "(NOT part of CMKD -- added on top, same as train_mfa.py)")
     parser.add_argument("--s2-cross-mode", choices=["mask", "gini"], default="mask")
+    parser.add_argument("--s2-self-from-teacher", action="store_true",
+                         help="Self-loss's reference (coe/mix in CMKD's task_loss/distill_loss) "
+                              "comes from Teacher2's EMA cosine branch (model2.teacher_model, "
+                              "detached) instead of the live student's own -- vlpuda_pure's own "
+                              "cmkd.py/make_model.py gained an optional self_ref_logit_clip param "
+                              "for this (default None preserves the original behavior exactly). "
+                              "reg_loss's entropy-min term still always uses the LIVE cosine "
+                              "branch (unaffected), so it keeps training it regardless.")
     parser.add_argument("--s2-ema-momentum", type=float, default=0.99,
                          help="ONE shared EMA momentum for BOTH model2.teacher_model "
                               "(backbone) and teacher_classifier_layer (head), active AFTER "
@@ -453,9 +465,16 @@ def main():
             # returned before). This already includes clf_loss
             # (label_smoothing baked into model2.clf_loss) AND the full CMKD
             # self-training loss (task_loss + distill_loss + reg_loss, see
-            # models/cmkd.py) -- no teacher/EMA involved in this loss at
-            # all, by design.
-            clf_loss, transfer_loss, target_logits2 = model2(data_x2, data_u2, label_x2)
+            # models/cmkd.py) -- no teacher/EMA involved in this loss by
+            # default (real CMKD design), UNLESS --s2-self-from-teacher.
+            self_ref_logit_clip = None
+            if args.s2_self_from_teacher:
+                with torch.no_grad():
+                    teacher_feat_u2 = model2.teacher_model.forward_features(data_u2)
+                    self_ref_logit_clip = model2.teacher_model.forward_head(teacher_feat_u2).detach()
+            clf_loss, transfer_loss, target_logits2 = model2(
+                data_x2, data_u2, label_x2, self_ref_logit_clip=self_ref_logit_clip
+            )
             loss2_self = clf_loss + transfer_loss
 
             if in_warmup:

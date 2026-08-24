@@ -46,7 +46,8 @@ class TransferNet(nn.Module):
             self.cmkd = cmkd.CMKD(args)
             self.clf_loss = torch.nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
-    def forward(self, source, target_img, source_label, target_strong=None, label_set=None):
+    def forward(self, source, target_img, source_label, target_strong=None, label_set=None,
+                self_ref_logit_clip=None):
         self.base_network.apply(fix_bn)
         source = self.base_network.forward_features(source)
 
@@ -64,7 +65,8 @@ class TransferNet(nn.Module):
             target_logits = self.classifier_layer(target)
 
             # calculate calibrated gini impurity loss Lcgi
-            transfer_loss = self.cmkd(target_logits, target_clip_logits, source_logits_clip, source_label,label_set)
+            transfer_loss = self.cmkd(target_logits, target_clip_logits, source_logits_clip, source_label,label_set,
+                                       self_ref_logit_clip=self_ref_logit_clip)
 
         else:
             transfer_loss = torch.tensor(0).to(source_label.device)
