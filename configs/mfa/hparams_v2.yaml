@@ -1,0 +1,36 @@
+# Per-branch hyperparameter defaults for train_mfa_v2.py. Loaded via
+# --hparams-config and applied as argparse defaults -- any flag passed
+# explicitly on the command line still overrides the value here.
+#
+# Student 1 (PHPL-style, LoRA) -- identical to configs/mfa/hparams.yaml's s1
+# section (train_mfa.py). Untouched by v2's design (only Student 2 changed).
+s1:
+  lr: 0.0035
+  momentum: 0.9
+  weight_decay: 5.0e-4
+  mmd_weight: 1.0
+  warmup_lr: 0.001
+  cross_weight: 0.5
+  ema_momentum: 0.99
+
+# Student 2 -- now the REAL vlpuda_pure/models/make_model.py TransferNet +
+# models/cmkd.py CMKD, not a reimplementation. Values match VLP-UDA's own
+# configs/office_home.yaml (ViT-B). No lamb_gamma/no_lamb_ramp/head_* here --
+# CMKD's own LambdaSheduler (gamma=1.0, fixed, not exposed as a CLI knob in
+# the real code) and there's no separate classifier-head EMA in vlpuda_pure's
+# design (only base_network gets a teacher_model copy) -- see
+# vlpuda_pure/utils/tools.py's ema_update_teacher.
+s2:
+  lr: 3.0e-6
+  multiple_lr_classifier: 1000
+  lr_gamma: 0.0003
+  lr_decay: 0.75
+  weight_decay: 5.0e-4
+  momentum: 0.9
+  label_smoothing: 0.1
+  lambda1: 0.25
+  lambda2: 0.1
+  lambda3: 0.025
+  cross_weight: 0.5
+  cross_mode: mask
+  ema_momentum: 0.99
