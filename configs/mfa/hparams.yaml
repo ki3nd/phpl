@@ -12,7 +12,7 @@ s1:
   mmd_weight: 1.0
   warmup_lr: 0.001
   cross_weight: 0.5
-  ema_momentum: 0.996
+  ema_momentum: 0.99
 
 # Student 2 (VLP-UDA-style, full backbone finetune -- no LoRA). Values match
 # VLP-UDA's own configs/office_home.yaml (ViT-B), NOT its argparse defaults
@@ -31,6 +31,6 @@ s2:
   lamb_gamma: 1.0
   cross_weight: 0.5
   cross_mode: mask
-  backbone_ema_momentum: 0.996
-  head_ema_momentum: 0.996
+  backbone_ema_momentum: 0.99
+  head_ema_momentum: 0.99
   head_warmup_iters: 100

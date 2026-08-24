@@ -477,19 +477,21 @@ def main():
                 loss2 = loss_x2 + loss_u2_self
                 lamb = 1.0  # no ramp during warmup -- there's only one (frozen) reference
             else:
-                # Self reference is student2_backbone's OWN cosine branch
-                # (logits2_u2_clip, computed in the SAME forward call as
-                # feat2_u2 above) -- matches CMKD's real design (models/
-                # cmkd.py + make_model.py's forward()): base_network's
-                # forward_features/forward_head are the SAME live network,
-                # no separate teacher/EMA involved for self-training at all.
-                # Detached to match CMKD's own task_loss/distill_loss (coe is
-                # already detached inside _calibrated_coefficient, and the
-                # mix term detaches target_pred_clip) -- only reg_loss below
-                # trains the cosine branch, via an UNDETACHED copy.
+                # Self-loss reference is Teacher2's (EMA) cosine branch, NOT
+                # student2_backbone's own live one -- both are detached
+                # either way (no gradient flows through the self-loss
+                # reference regardless, see below), so swapping costs
+                # nothing on the gradient side, but Teacher2's EMA-smoothed
+                # weights give a more stable target than the live student's
+                # (which shifts slightly every micro-step on a fresh batch)
+                # -- the "temporal fusion" idea this whole architecture is
+                # built around, applied to Student2's self-loss too now.
+                # reg_loss still trains student2_backbone's OWN cosine branch
+                # directly (pred_self2_clip_live, undetached) -- unaffected.
                 pred_self2_clip_live = F.softmax(logits2_u2_clip, dim=-1)
-                prob_self2 = pred_self2_clip_live.detach()
                 with torch.no_grad():
+                    logits_self2_teacher, _ = teacher2_backbone(image_u2)
+                    prob_self2 = F.softmax(logits_self2_teacher, dim=-1)
                     logits_t1_u2, _ = teacher1(image_u2)
                     prob_cross2 = F.softmax(logits_t1_u2, dim=-1)
 
