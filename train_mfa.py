@@ -9,10 +9,17 @@ STRUCTURALLY DIFFERENT architectures instead of MFA's two identical nets:
   - Student 1 / Teacher 1: PHPL-style -- LoRA-adapted CLIP, cosine-similarity
     classification against text embeddings (trainers/da/phpl_momentum.py's
     CustomCLIP/_FrozenTeacherCLIP).
-  - Student 2 / Teacher 2: VLP-UDA-style -- a SEPARATE LoRA-adapted CLIP plus
-    a learned classifier_layer (train_cmkd.py's _ClassifierHead: BatchNorm1d
-    -> LayerNorm -> Linear), trained jointly (not the frozen-backbone phase-2
-    split train_cmkd.py uses -- here the backbone trains too).
+  - Student 2 / Teacher 2: VLP-UDA-style -- a SEPARATE CLIP whose vision
+    encoder is finetuned DIRECTLY (no LoRA, matching VLP-UDA's own
+    make_model.py) plus a learned classifier_layer (train_cmkd.py's
+    _ClassifierHead: BatchNorm1d -> LayerNorm -> Linear), trained jointly
+    (not the frozen-backbone phase-2 split train_cmkd.py uses -- here the
+    backbone trains too).
+
+Per-branch hyperparameters live in a YAML file (--hparams-config, default
+configs/mfa/hparams.yaml) with "s1"/"s2" sections, loaded as argparse
+defaults -- any flag passed explicitly on the command line still overrides
+the YAML value.
 
 Each teacher is its own model's EMA (temporal fusion, unchanged from
 elsewhere in this project). Each student's target-domain loss has TWO parts,
@@ -46,6 +53,7 @@ import math
 import os.path as osp
 
 import torch
+import yaml
 from torch.nn import functional as F
 
 from dassl.data import DataManager
@@ -59,6 +67,19 @@ from trainers.da.phpl_momentum import (
     CustomCLIP, _FrozenTeacherCLIP, _copy_lora_params, _ema_update_lora_params,
 )
 from train_cmkd import build_cfg, CyclingLoader, _gini_impurity, _calibrated_coefficient, _ClassifierHead
+
+
+def _load_hparams_as_defaults(parser, path):
+    """Load the s1/s2 sections of --hparams-config as argparse defaults --
+    any flag passed explicitly on the command line still overrides these
+    (argparse only falls back to a default when the flag is omitted)."""
+    with open(path) as f:
+        hp = yaml.safe_load(f) or {}
+    flat = {}
+    for branch in ("s1", "s2"):
+        for k, v in (hp.get(branch) or {}).items():
+            flat[f"{branch}_{k}"] = v
+    parser.set_defaults(**flat)
 
 
 @torch.no_grad()
@@ -110,6 +131,36 @@ def _build_lora_pair(cfg, is_vit, classnames, device):
     teacher.to(device)
     teacher.eval()
     return student, teacher, list_lora_student, list_lora_teacher
+
+
+def _build_finetune_pair(cfg, classnames, device):
+    """Student2/Teacher2 backbone -- plain CustomCLIP, NO LoRA. Matches
+    VLP-UDA's own make_model.py: only the vision encoder (image_encoder =
+    clip_model.visual) is finetuned directly; text_encoder/logit_scale stay
+    frozen (VLP-UDA doesn't train them either). Teacher is a full-weight EMA
+    of the vision encoder (temporal fusion), hard-copied from student at
+    init."""
+    clip_student = load_clip_to_cpu(cfg)
+    clip_teacher = load_clip_to_cpu(cfg)
+    if cfg.TRAINER.PHPLMOMENTUM.PREC in ("fp32", "amp"):
+        clip_student.float()
+        clip_teacher.float()
+
+    student = CustomCLIP(cfg, classnames, clip_student)
+    teacher = _FrozenTeacherCLIP(cfg, classnames, clip_teacher)
+
+    for param in student.parameters():
+        param.requires_grad_(False)
+    for param in student.image_encoder.parameters():
+        param.requires_grad_(True)
+    for param in teacher.parameters():
+        param.requires_grad_(False)
+
+    teacher.image_encoder.load_state_dict(student.image_encoder.state_dict())
+    student.to(device)
+    teacher.to(device)
+    teacher.eval()
+    return student, teacher
 
 
 @torch.no_grad()
@@ -176,60 +227,52 @@ def main():
     parser.add_argument("--s2-per-s1", type=int, default=10)
     parser.add_argument("--print-freq", type=int, default=50, help="in macro-steps")
     parser.add_argument("--eval-freq", type=int, default=200, help="in macro-steps")
+    parser.add_argument("--hparams-config", type=str, default="configs/mfa/hparams.yaml",
+                         help="YAML file with s1/s2 per-branch hyperparameter defaults -- "
+                              "see _load_hparams_as_defaults()")
 
-    # Student 1 (PHPL-style) -- its own LoRA LR. Plain SGD, matching PHPL's
-    # own recipe.
+    # Student 1 (PHPL-style, LoRA). Plain SGD, matching PHPL's own recipe.
+    # Defaults come from --hparams-config's "s1" section (see below);
+    # add_argument's own default= here is just a fallback if that file is
+    # missing/edited, not the real source of truth.
     parser.add_argument("--s1-lr", type=float, default=0.0035)
     parser.add_argument("--s1-momentum", type=float, default=0.9)
     parser.add_argument("--s1-weight-decay", type=float, default=5e-4)
     # PHPL's own default (MMD_WEIGHT=1.0, always on) -- a domain-alignment
-    # term between Student1's source/target features, missing from the
-    # earlier version of this script entirely. Student 2 has no equivalent
-    # (VLP-UDA's own design doesn't include one).
+    # term between Student1's source/target features.
     parser.add_argument("--s1-mmd-weight", type=float, default=1.0)
-
-    # Student 2 (VLP-UDA-style) -- TWO separate LRs (backbone LoRA vs
-    # classifier head), same order of magnitude as Student 1's LoRA LR for
-    # the backbone (NOT VLP-UDA's own tiny 3e-6 -- too low to converge in a
-    # short budget, confirmed the hard way earlier in this project) and a
-    # much larger one for the freshly-initialized classifier head.
-    parser.add_argument("--s2-lora-lr", type=float, default=0.0035)
-    parser.add_argument("--s2-lora-momentum", type=float, default=0.9)
-    parser.add_argument("--s2-lora-weight-decay", type=float, default=5e-4)
-    parser.add_argument("--s2-clf-optim", choices=["sgd", "adam"], default="sgd")
-    parser.add_argument("--s2-clf-lr", type=float, default=0.003)
-    parser.add_argument("--s2-clf-weight-decay", type=float, default=5e-4)
-
-    parser.add_argument("--ema-momentum", type=float, default=0.996,
-                         help="Teacher1 and Teacher2-backbone's LoRA EMA momentum")
-    parser.add_argument("--head-ema-momentum", type=float, default=0.996,
-                         help="Teacher2-head's EMA momentum, active AFTER --head-warmup-iters")
-    parser.add_argument("--head-warmup-iters", type=int, default=100,
-                         help="Teacher2-head hard-copies Student 2's head every step for this "
-                              "many iterations (momentum=0) before switching to --head-ema-momentum "
-                              "-- mirrors the epoch-1 hard-copy lesson learned for a randomly "
-                              "initialized head elsewhere in this project.")
-
-    parser.add_argument("--lambda1", type=float, default=0.25, help="Student 2's CMKD task/distill weight")
-    # CMKD's own reg_loss (models/cmkd.py's regularization_term) -- trains the
-    # cosine branch itself (CE on source with its own label + entropy-min on
-    # target), VLP-UDA's own defaults.
-    parser.add_argument("--lambda2", type=float, default=0.1, help="Student 2's CMKD reg_loss: CE weight on source cosine branch")
-    parser.add_argument("--lambda3", type=float, default=0.025, help="Student 2's CMKD reg_loss: entropy-min weight on target cosine branch")
-    # VLP-UDA's own LambdaSheduler default -- lamb never reaches 1.0 with
-    # this (maxes out at ~0.46, at the very end of training).
-    parser.add_argument("--lamb-gamma", type=float, default=1.0, help="Student 2's lamb ramp gamma")
-    parser.add_argument("--no-lamb-ramp", action="store_true",
-                         help="skip the lamb ramp entirely -- lamb=1.0 for the whole post-warmup "
-                              "run, so the entropy-min terms are just a constant lambda1 weight")
-    # MFA's own default ratio (TEMPORAL_CONSIST_WEIGHT=1.0 self / CROSS_MODEL_
-    # CONSIST_WEIGHT=0.5 cross) -- confirmed via a real training log that
-    # cross-teaching at full (1.0) weight drags whichever student is
-    # currently WEAKER down toward its stronger partner (a "rich get richer"
-    # dynamic MFA's own homogeneous two-net setup doesn't suffer from as
-    # badly, since both nets there tend to stay closely matched).
+    parser.add_argument("--s1-warmup-lr", type=float, default=0.001)
     parser.add_argument("--s1-cross-weight", type=float, default=0.5,
                          help="weight on Student 1's cross-teaching loss term")
+    parser.add_argument("--s1-ema-momentum", type=float, default=0.996,
+                         help="Teacher1's LoRA EMA momentum")
+
+    # Student 2 (VLP-UDA-style, full backbone finetune -- no LoRA). Defaults
+    # come from --hparams-config's "s2" section, matching VLP-UDA's own
+    # configs/office_home.yaml (ViT-B) -- NOT its argparse script defaults,
+    # which are for a different config entirely.
+    parser.add_argument("--s2-lr", type=float, default=3e-6, help="vision-encoder LR")
+    parser.add_argument("--s2-multiple-lr-classifier", type=float, default=1000,
+                         help="classifier head LR = --s2-lr * this")
+    parser.add_argument("--s2-lr-gamma", type=float, default=0.0003)
+    parser.add_argument("--s2-lr-decay", type=float, default=0.75)
+    parser.add_argument("--s2-weight-decay", type=float, default=5e-4)
+    parser.add_argument("--s2-momentum", type=float, default=0.9)
+    parser.add_argument("--s2-label-smoothing", type=float, default=0.1,
+                         help="applied to loss_x2 (classifier CE on source) only, not reg_loss's "
+                              "cosine-branch CE -- matches VLP-UDA's own clf_loss/regularization_term")
+    parser.add_argument("--s2-lambda1", type=float, default=0.25, help="Student 2's CMKD task/distill weight")
+    # CMKD's own reg_loss (models/cmkd.py's regularization_term) -- trains the
+    # cosine branch itself (CE on source with its own label + entropy-min on
+    # target).
+    parser.add_argument("--s2-lambda2", type=float, default=0.1, help="Student 2's CMKD reg_loss: CE weight on source cosine branch")
+    parser.add_argument("--s2-lambda3", type=float, default=0.025, help="Student 2's CMKD reg_loss: entropy-min weight on target cosine branch")
+    # VLP-UDA's own LambdaSheduler default -- lamb never reaches 1.0 with
+    # this (maxes out at ~0.46, at the very end of training).
+    parser.add_argument("--s2-lamb-gamma", type=float, default=1.0, help="Student 2's lamb ramp gamma")
+    parser.add_argument("--s2-no-lamb-ramp", action="store_true",
+                         help="skip the lamb ramp entirely -- lamb=1.0 for the whole post-warmup "
+                              "run, so the entropy-min terms are just a constant lambda1 weight")
     parser.add_argument("--s2-cross-weight", type=float, default=0.5,
                          help="weight on Student 2's cross-teaching loss term")
     parser.add_argument("--s2-cross-mode", choices=["mask", "gini"], default="mask",
@@ -240,35 +283,38 @@ def main():
                               "cosine-similarity branch is naturally sharp (logit_scale~100), so "
                               "it fits the sharp-reference role CMKD's calibrated_coefficient "
                               "expects.")
+    parser.add_argument("--s2-backbone-ema-momentum", type=float, default=0.996,
+                         help="Teacher2-backbone's full-weight (no LoRA) EMA momentum")
+    parser.add_argument("--s2-head-ema-momentum", type=float, default=0.996,
+                         help="Teacher2-head's EMA momentum, active AFTER --s2-head-warmup-iters")
+    parser.add_argument("--s2-head-warmup-iters", type=int, default=100,
+                         help="Teacher2-head hard-copies Student 2's head every step for this "
+                              "many iterations (momentum=0) before switching to "
+                              "--s2-head-ema-momentum -- mirrors the epoch-1 hard-copy lesson "
+                              "learned for a randomly initialized head elsewhere in this project.")
 
     # Warmup: both students train INDEPENDENTLY (no self/cross split, no
     # cross-teaching at all) against a single shared FROZEN zero-shot CLIP
-    # (no LoRA) for this many iterations first -- at iteration 0, neither
-    # Teacher1 nor Teacher2 has anything meaningful to teach yet (Teacher2's
-    # classifier head starts genuinely random), so bootstrapping from a
-    # stable, always-reasonable frozen reference avoids each student
-    # poisoning the other via cross-teaching before either is ready. AFTER
-    # warmup, this frozen reference is dropped ENTIRELY (not blended in,
-    # confirmed by prior experimentation on the PHPL branch: dropping the
-    # frozen teacher outright from epoch 2 on beat a beta-blend with it) and
-    # replaced by each student's own (by-then-adapted) EMA teacher for self,
-    # plus the other pair's teacher for cross.
+    # for this many macro-steps first -- at iteration 0, neither Teacher1 nor
+    # Teacher2 has anything meaningful to teach yet (Teacher2's classifier
+    # head starts genuinely random), so bootstrapping from a stable,
+    # always-reasonable frozen reference avoids each student poisoning the
+    # other via cross-teaching before either is ready. AFTER warmup, this
+    # frozen reference is dropped ENTIRELY (not blended in, confirmed by
+    # prior experimentation on the PHPL branch: dropping the frozen teacher
+    # outright from epoch 2 on beat a beta-blend with it) and replaced by
+    # each student's own (by-then-adapted) EMA teacher for self, plus the
+    # other pair's teacher for cross.
+    # Student 1 gets a separate CONSTANT warmup LR (--s1-warmup-lr, not its
+    # main cosine schedule) -- Student 2 does NOT: it keeps stepping its own
+    # VLP-UDA-style LR schedule (--s2-lr-gamma/--s2-lr-decay) from iteration
+    # 0 straight through warmup, since VLP-UDA's own recipe has no separate
+    # warmup-LR concept at all.
     # In macro-steps -- 100 for Student 1, which (at the default --s2-per-s1=10)
     # naturally gives Student 2 exactly 1000 warmup micro-iterations too.
     parser.add_argument("--warmup-iters", type=int, default=100)
-    # Warmup LR is a separate CONSTANT for each of the 3 optimizers, not the
-    # main cosine schedule -- 0.001, not PHPL's own literal WARMUP_CONS_LR
-    # (1e-5), per the user's own testing (1e-5 under-trained Teacher1 during
-    # warmup relative to a plain PHPL run).
-    parser.add_argument("--s1-warmup-lr", type=float, default=0.001)
-    parser.add_argument("--s2-lora-warmup-lr", type=float, default=0.001)
-    # Unlike the two LoRA warmup LRs above, this one is NOT tiny -- the
-    # classifier head starts near-random (not a good SVD-reconstructed point
-    # like LoRA), so it needs to actually learn during warmup, not just "not
-    # move much". Defaults to the same value as --s2-clf-lr (no separate
-    # suppression during warmup).
-    parser.add_argument("--s2-clf-warmup-lr", type=float, default=0.003)
 
+    _load_hparams_as_defaults(parser, parser.parse_known_args()[0].hparams_config)
     args = parser.parse_args()
     cfg = build_cfg(args)
     device = torch.device(f"cuda:{cfg.GPU}" if torch.cuda.is_available() else "cpu")
@@ -289,8 +335,8 @@ def main():
     print("Building Student1/Teacher1 (PHPL-style)")
     student1, teacher1, lora1_s, lora1_t = _build_lora_pair(cfg, is_vit, classnames, device)
 
-    print("Building Student2/Teacher2 (VLP-UDA-style)")
-    student2_backbone, teacher2_backbone, lora2_s, lora2_t = _build_lora_pair(cfg, is_vit, classnames, device)
+    print("Building Student2/Teacher2 (VLP-UDA-style, full backbone finetune)")
+    student2_backbone, teacher2_backbone = _build_finetune_pair(cfg, classnames, device)
     feat_dim = student2_backbone.text_encoder.text_projection.shape[1]
     student2_head = _ClassifierHead(feat_dim, num_classes).to(device)
     teacher2_head = _ClassifierHead(feat_dim, num_classes).to(device)
@@ -318,28 +364,31 @@ def main():
         [p for p in student1.parameters() if p.requires_grad],
         lr=args.s1_lr, momentum=args.s1_momentum, weight_decay=args.s1_weight_decay,
     )
-    optim2_backbone = torch.optim.SGD(
-        [p for p in student2_backbone.parameters() if p.requires_grad],
-        lr=args.s2_lora_lr, momentum=args.s2_lora_momentum, weight_decay=args.s2_lora_weight_decay,
+    # Single SGD, 2 param groups, matching VLP-UDA's own get_optimizer()/
+    # get_parameters() exactly (nesterov=True for BOTH groups).
+    optim2 = torch.optim.SGD(
+        [
+            {"params": student2_backbone.image_encoder.parameters(), "lr": args.s2_lr},
+            {"params": student2_head.parameters(), "lr": args.s2_multiple_lr_classifier * args.s2_lr},
+        ],
+        momentum=args.s2_momentum, weight_decay=args.s2_weight_decay, nesterov=True,
     )
-    if args.s2_clf_optim == "adam":
-        optim2_head = torch.optim.Adam(student2_head.parameters(), lr=args.s2_clf_lr,
-                                        weight_decay=args.s2_clf_weight_decay)
-    else:
-        optim2_head = torch.optim.SGD(student2_head.parameters(), lr=args.s2_clf_lr,
-                                       momentum=0.9, nesterov=True, weight_decay=args.s2_clf_weight_decay)
 
     s2_total_iters = args.s1_total_iters * args.s2_per_s1
     s2_warmup_iters = args.warmup_iters * args.s2_per_s1
     s1_post_warmup = max(args.s1_total_iters - args.warmup_iters, 1)
     s2_post_warmup = max(s2_total_iters - s2_warmup_iters, 1)
 
-    # Cosine schedules span each student's OWN post-warmup budget -- during
+    # Student 1's cosine schedule spans its OWN post-warmup budget -- during
     # warmup, LR is held at a separate constant instead (see the loop below),
     # and the scheduler is never .step()'d until warmup ends.
     sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(optim1, T_max=s1_post_warmup)
-    sched2_backbone = torch.optim.lr_scheduler.CosineAnnealingLR(optim2_backbone, T_max=s2_post_warmup)
-    sched2_head = torch.optim.lr_scheduler.CosineAnnealingLR(optim2_head, T_max=s2_post_warmup)
+    # Student 2's schedule is VLP-UDA's own LambdaLR decay ((1+gamma*step)^
+    # -decay), stepped every micro-iteration from iteration 0 -- no warmup
+    # pause, matching VLP-UDA's own recipe (it has no warmup-LR concept).
+    sched2 = torch.optim.lr_scheduler.LambdaLR(
+        optim2, lr_lambda=lambda step: (1.0 + args.s2_lr_gamma * step) ** (-args.s2_lr_decay)
+    )
 
     confi = cfg.TRAINER.PHPLMOMENTUM.CONFI
     best_acc1, best_acc2, best_acc_ens = 0.0, 0.0, 0.0
@@ -353,8 +402,8 @@ def main():
     def _task_distill(pred_own, pred_ref, lamb):
         coe = _calibrated_coefficient(pred_own, pred_ref)
         pred_mix = 0.5 * (pred_own + pred_ref)
-        task = args.lambda1 * lamb * _gini_impurity(pred_own, coe)
-        distill = args.lambda1 * lamb * _gini_impurity(pred_mix, 1 - coe)
+        task = args.s2_lambda1 * lamb * _gini_impurity(pred_own, coe)
+        distill = args.s2_lambda1 * lamb * _gini_impurity(pred_mix, 1 - coe)
         return task + distill
 
     s2_it_global = 0
@@ -392,7 +441,9 @@ def main():
 
             logits2_x2_clip, feat2_x2 = student2_backbone(image_x2)
             logits2_x2 = student2_head(feat2_x2.float())
-            loss_x2 = F.cross_entropy(logits2_x2, label_x2)
+            # label_smoothing matches VLP-UDA's own clf_loss -- applies ONLY
+            # to this classifier CE, not reg_loss's cosine-branch CE below.
+            loss_x2 = F.cross_entropy(logits2_x2, label_x2, label_smoothing=args.s2_label_smoothing)
 
             logits2_u2_clip, feat2_u2 = student2_backbone(image_u2)
             logits2_u2 = student2_head(feat2_u2.float())
@@ -402,7 +453,7 @@ def main():
                 with torch.no_grad():
                     logits_frozen_u2, _ = teacher_frozen(image_u2)
                     prob_frozen_u2 = F.softmax(logits_frozen_u2, dim=-1)
-                loss_u2_self = args.lambda1 * (
+                loss_u2_self = args.s2_lambda1 * (
                     _gini_impurity(pred2_u2, _calibrated_coefficient(pred2_u2, prob_frozen_u2))
                     + _gini_impurity(
                         0.5 * (pred2_u2 + prob_frozen_u2),
@@ -430,10 +481,10 @@ def main():
                     logits_t1_u2, _ = teacher1(image_u2)
                     prob_cross2 = F.softmax(logits_t1_u2, dim=-1)
 
-                if args.no_lamb_ramp:
+                if args.s2_no_lamb_ramp:
                     lamb = 1.0
                 else:
-                    lamb = _cmkd_lamb(s2_it_global - s2_warmup_iters, s2_post_warmup, args.lamb_gamma)
+                    lamb = _cmkd_lamb(s2_it_global - s2_warmup_iters, s2_post_warmup, args.s2_lamb_gamma)
                 loss_u2_self = _task_distill(pred2_u2, prob_self2, lamb)
                 if args.s2_cross_mode == "gini":
                     # CMKD's own task/distill formula, same as self, but with
@@ -448,29 +499,22 @@ def main():
                 # trains the cosine branch itself directly -- CE on source
                 # with its true label, plus entropy-min on target.
                 reg_loss = (
-                    args.lambda2 * F.cross_entropy(logits2_x2_clip, label_x2)
-                    + args.lambda3 * lamb * _gini_impurity(pred_self2_clip_live)
+                    args.s2_lambda2 * F.cross_entropy(logits2_x2_clip, label_x2)
+                    + args.s2_lambda3 * lamb * _gini_impurity(pred_self2_clip_live)
                 )
 
                 loss2 = loss_x2 + loss_u2_self + args.s2_cross_weight * loss_u2_cross + reg_loss
 
-            if in_warmup:
-                for pg in optim2_backbone.param_groups:
-                    pg["lr"] = args.s2_lora_warmup_lr
-                for pg in optim2_head.param_groups:
-                    pg["lr"] = args.s2_clf_warmup_lr
-
-            optim2_backbone.zero_grad()
-            optim2_head.zero_grad()
+            optim2.zero_grad()
             loss2.backward()
-            optim2_backbone.step()
-            optim2_head.step()
-            if not in_warmup:
-                sched2_backbone.step()
-                sched2_head.step()
+            optim2.step()
+            # No warmup pause -- VLP-UDA's own LR schedule runs continuously
+            # from iteration 0 (see --s2-lr-gamma/--s2-lr-decay above).
+            sched2.step()
 
-            _ema_update_lora_params(teacher2_backbone, student2_backbone, lambda k: args.ema_momentum)
-            head_momentum = 0.0 if s2_it_global < args.head_warmup_iters else args.head_ema_momentum
+            _ema_update_module(teacher2_backbone.image_encoder, student2_backbone.image_encoder,
+                                args.s2_backbone_ema_momentum)
+            head_momentum = 0.0 if s2_it_global < args.s2_head_warmup_iters else args.s2_head_ema_momentum
             _ema_update_module(teacher2_head, student2_head, head_momentum)
             s2_it_global += 1
 
@@ -511,7 +555,7 @@ def main():
         if not in_warmup:
             sched1.step()
 
-        _ema_update_lora_params(teacher1, student1, lambda k: args.ema_momentum)
+        _ema_update_lora_params(teacher1, student1, lambda k: args.s1_ema_momentum)
 
         if (macro + 1) % args.print_freq == 0:
             acc_x1 = (logits1_x.argmax(-1) == label_x1).float().mean().item() * 100

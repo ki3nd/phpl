@@ -1,0 +1,36 @@
+# Per-branch hyperparameter defaults for train_mfa.py. Loaded via
+# --hparams-config and applied as argparse defaults -- any flag passed
+# explicitly on the command line still overrides the value here.
+#
+# Student 1 (PHPL-style, LoRA) is a straight mirror of the CLI defaults it
+# already had before this file existed -- DO NOT change these without
+# re-testing, it's the branch that's already learning well.
+s1:
+  lr: 0.0035
+  momentum: 0.9
+  weight_decay: 5.0e-4
+  mmd_weight: 1.0
+  warmup_lr: 0.001
+  cross_weight: 0.5
+  ema_momentum: 0.996
+
+# Student 2 (VLP-UDA-style, full backbone finetune -- no LoRA). Values match
+# VLP-UDA's own configs/office_home.yaml (ViT-B), NOT its argparse defaults
+# (which are for a different, unused default config).
+s2:
+  lr: 3.0e-6
+  multiple_lr_classifier: 1000
+  lr_gamma: 0.0003
+  lr_decay: 0.75
+  weight_decay: 5.0e-4
+  momentum: 0.9
+  label_smoothing: 0.1
+  lambda1: 0.25
+  lambda2: 0.1
+  lambda3: 0.025
+  lamb_gamma: 1.0
+  cross_weight: 0.5
+  cross_mode: mask
+  backbone_ema_momentum: 0.996
+  head_ema_momentum: 0.996
+  head_warmup_iters: 100
