@@ -224,14 +224,14 @@ def train(source_loader, target_train_loader, target_test_loader, model, optimiz
             if args.use_amp:
                 # mixture precision
                 with autocast():
-                    clf_loss, transfer_loss = model(data_source, data_target, label_source, data_target_strong)
+                    clf_loss, transfer_loss, _ = model(data_source, data_target, label_source, data_target_strong)
                     loss = clf_loss + transfer_loss
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 # fully precision
-                clf_loss, transfer_loss = model(data_source, data_target, label_source, data_target_strong, label_set)
+                clf_loss, transfer_loss, _ = model(data_source, data_target, label_source, data_target_strong, label_set)
                 loss = clf_loss + transfer_loss
                 loss.backward()
                 optimizer.step()

@@ -447,37 +447,30 @@ def main():
             # classifier_layer's mode directly instead.
             model2.base_network.train()
             model2.classifier_layer.train()
-            # TransferNet.forward() -- untouched, real VLP-UDA code. This
-            # already includes clf_loss (label_smoothing baked into
-            # model2.clf_loss) AND the full CMKD self-training loss
-            # (task_loss + distill_loss + reg_loss, see models/cmkd.py) --
-            # no teacher/EMA involved in this loss at all, by design.
-            clf_loss, transfer_loss = model2(data_x2, data_u2, label_x2)
+            # TransferNet.forward() now returns target_logits too (a small,
+            # additive change to vlpuda_pure/models/make_model.py -- it was
+            # already computed internally for transfer_loss/cmkd, just not
+            # returned before). This already includes clf_loss
+            # (label_smoothing baked into model2.clf_loss) AND the full CMKD
+            # self-training loss (task_loss + distill_loss + reg_loss, see
+            # models/cmkd.py) -- no teacher/EMA involved in this loss at
+            # all, by design.
+            clf_loss, transfer_loss, target_logits2 = model2(data_x2, data_u2, label_x2)
             loss2_self = clf_loss + transfer_loss
 
-            if in_warmup or args.s2_cross_weight == 0.0:
-                # Skipping the predict() call entirely (not just zero-
-                # weighting its result) when cross-teaching is off matters:
-                # model2.predict() is an EXTRA forward through
-                # classifier_layer beyond what TransferNet.forward() already
-                # does (source + target), and classifier_layer.train() means
-                # its BatchNorm1d mutates running_mean/running_var on every
-                # call regardless of what weight is later applied to the
-                # loss that consumes it -- multiplying by 0.0 zeroes the
-                # GRADIENT but not this side effect. With --s2-cross-weight
-                # 0.0, this keeps Student2 bit-for-bit on the same BatchNorm
-                # statistics trajectory as a standalone VLP-UDA run.
+            if in_warmup:
                 loss2_cross = torch.tensor(0.0, device=device)
                 loss2 = loss2_self
             else:
                 # Cross-teaching is NOT part of CMKD -- added on top here,
-                # same mechanism as train_mfa.py. Needs Student2's own
-                # target-domain logits, which TransferNet.forward() doesn't
-                # return -- predict() recomputes them (an extra, harmless
-                # forward pass; kept separate rather than touching
-                # TransferNet.forward()'s return signature, to preserve
-                # 100% fidelity to the original code).
-                target_logits2 = model2.predict(data_u2)
+                # same mechanism as train_mfa.py. Reuses target_logits2
+                # above instead of a separate model2.predict(data_u2) call
+                # -- that used to cost a WHOLE EXTRA forward pass through
+                # the full CLIP backbone (a real OOM contributor on top of
+                # the 5 CLIP model copies already in play), and it mutated
+                # classifier_layer's BatchNorm1d running stats an extra
+                # time regardless of --s2-cross-weight's value. Neither
+                # concern applies anymore -- target_logits2 is free.
                 with torch.no_grad():
                     logits_t1_u2, _ = teacher1(data_u2)
                     prob_cross2 = F.softmax(logits_t1_u2, dim=-1)
@@ -540,7 +533,8 @@ def main():
 
         if (macro + 1) % args.print_freq == 0:
             acc_x1 = (logits1_x.argmax(-1) == label_x1).float().mean().item() * 100
-            acc_x2 = (torch.max(model2.predict(data_x2), 1)[1] == label_x2).float().mean().item() * 100
+            with torch.no_grad():
+                acc_x2 = (torch.max(model2.predict(data_x2), 1)[1] == label_x2).float().mean().item() * 100
             print(
                 f"macro [{macro + 1}/{args.s1_total_iters}] (s2 iter {s2_it_global}/{s2_total_iters}) "
                 f"loss1 {loss1.item():.4f} (x {loss_x1.item():.4f} self {loss_u1_self.item():.4f} "

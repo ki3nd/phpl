@@ -54,6 +54,7 @@ class TransferNet(nn.Module):
         source_logits = self.classifier_layer(source)
         clf_loss = self.clf_loss(source_logits, source_label)
 
+        target_logits = None
         if not self.args.baseline:
             source_logits_clip = self.base_network.forward_head(source)
             target = self.base_network.forward_features(target_img)
@@ -95,7 +96,7 @@ class TransferNet(nn.Module):
             clf_loss = 0.5 * clf_loss
             transfer_loss = 0.1 * transfer_loss
 
-        return clf_loss, transfer_loss
+        return clf_loss, transfer_loss, target_logits
 
     def get_parameters(self, initial_lr=1.0):
         params=[
