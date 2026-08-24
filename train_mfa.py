@@ -487,8 +487,8 @@ def main():
                 # already detached inside _calibrated_coefficient, and the
                 # mix term detaches target_pred_clip) -- only reg_loss below
                 # trains the cosine branch, via an UNDETACHED copy.
-                prob_self2 = F.softmax(logits2_u2_clip.detach(), dim=-1)
                 pred_self2_clip_live = F.softmax(logits2_u2_clip, dim=-1)
+                prob_self2 = pred_self2_clip_live.detach()
                 with torch.no_grad():
                     logits_t1_u2, _ = teacher1(image_u2)
                     prob_cross2 = F.softmax(logits_t1_u2, dim=-1)
