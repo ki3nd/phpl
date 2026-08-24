@@ -72,13 +72,25 @@ from train_cmkd import build_cfg, CyclingLoader, _gini_impurity, _calibrated_coe
 def _load_hparams_as_defaults(parser, path):
     """Load the s1/s2 sections of --hparams-config as argparse defaults --
     any flag passed explicitly on the command line still overrides these
-    (argparse only falls back to a default when the flag is omitted)."""
+    (argparse only falls back to a default when the flag is omitted).
+    parser.set_defaults() silently accepts unknown dest names (they'd just
+    never be read), so a YAML key that doesn't match any registered
+    --s1-*/--s2-* flag (typo, or a flag renamed later without updating the
+    YAML) is validated here instead of failing silently."""
+    known = {action.dest for action in parser._actions}
     with open(path) as f:
         hp = yaml.safe_load(f) or {}
     flat = {}
     for branch in ("s1", "s2"):
         for k, v in (hp.get(branch) or {}).items():
-            flat[f"{branch}_{k}"] = v
+            dest = f"{branch}_{k}"
+            if dest not in known:
+                raise ValueError(
+                    f"{path}: '{branch}.{k}' does not match any registered "
+                    f"--{branch}-{k.replace('_', '-')} flag -- typo, or the "
+                    f"flag was renamed without updating this YAML?"
+                )
+            flat[dest] = v
     parser.set_defaults(**flat)
 
 
