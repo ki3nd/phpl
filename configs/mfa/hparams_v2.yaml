@@ -19,8 +19,12 @@ s1:
 # own LambdaSheduler (gamma=1.0, fixed, not exposed as a CLI knob in the real
 # code). vlpuda_pure's own design has no classifier-head EMA at all (only
 # base_network gets a teacher_model copy) -- this project adds one anyway
-# (teacher_classifier_layer, see train_mfa_v2.py), hence head_ema_momentum/
-# head_warmup_iters below, matching train_mfa.py's own teacher2_head pattern.
+# (teacher_classifier_layer, see train_mfa_v2.py). ema_momentum is ONE
+# shared value for both the backbone (teacher_model) and the head
+# (teacher_classifier_layer) -- both hard-copy together for
+# ema_warmup_iters, then both switch to this momentum together, so
+# Teacher2 is never a smoothed backbone paired with an instantaneously-
+# tracking head or vice versa.
 s2:
   lr: 3.0e-6
   multiple_lr_classifier: 1000
@@ -35,5 +39,4 @@ s2:
   cross_weight: 0.5
   cross_mode: mask
   ema_momentum: 0.99
-  head_ema_momentum: 0.99
-  head_warmup_iters: 100
+  ema_warmup_iters: 100

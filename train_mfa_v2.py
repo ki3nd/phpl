@@ -33,7 +33,7 @@ DataManager. Student 2 / Teacher 2 now:
     exists) -- this project adds one anyway (teacher_classifier_layer, a
     deepcopy of model2.classifier_layer), so "Teacher2" = EMA-backbone
     features fed through this separate EMA head, not the live one. Both
-    the backbone's and the head's EMA share the SAME --s2-head-warmup-iters
+    the backbone's and the head's EMA share the SAME --s2-ema-warmup-iters
     window (hard-copy together, then switch to their own real momentum
     together) -- otherwise Teacher2 would be a smoothed backbone paired
     with an instantaneously-tracking head (or vice versa) during that
@@ -256,17 +256,14 @@ def main():
                               "(NOT part of CMKD -- added on top, same as train_mfa.py)")
     parser.add_argument("--s2-cross-mode", choices=["mask", "gini"], default="mask")
     parser.add_argument("--s2-ema-momentum", type=float, default=0.99,
-                         help="EMA momentum for model2.teacher_model (backbone), active AFTER "
-                              "--s2-head-warmup-iters (same warmup window as the head, so "
-                              "both switch from hard-copy to real EMA together)")
-    parser.add_argument("--s2-head-ema-momentum", type=float, default=0.99,
-                         help="EMA momentum for teacher_classifier_layer, active AFTER "
-                              "--s2-head-warmup-iters")
-    parser.add_argument("--s2-head-warmup-iters", type=int, default=100,
+                         help="ONE shared EMA momentum for BOTH model2.teacher_model "
+                              "(backbone) and teacher_classifier_layer (head), active AFTER "
+                              "--s2-ema-warmup-iters")
+    parser.add_argument("--s2-ema-warmup-iters", type=int, default=100,
                          help="BOTH teacher_model and teacher_classifier_layer hard-copy "
                               "model2.base_network/classifier_layer every step for this many "
-                              "iterations (momentum=0) before switching to their own real EMA "
-                              "momentum -- kept in sync so Teacher2 is never a smoothed "
+                              "iterations (momentum=0) before switching to --s2-ema-momentum "
+                              "together -- kept in sync so Teacher2 is never a smoothed "
                               "backbone paired with an instantaneously-tracking head or vice "
                               "versa")
     parser.add_argument("--s2-batch-size", type=int, default=32)
@@ -361,7 +358,7 @@ def main():
     # base_network gets a teacher_model copy) -- the classifier head needs
     # its own teacher too, same as train_mfa.py's teacher2_head, since it's
     # a freshly-initialized (near-random, small-std) module just like
-    # there. Hard-copied every step for --s2-head-warmup-iters (mirrors the
+    # there. Hard-copied every step for --s2-ema-warmup-iters (mirrors the
     # epoch-1 hard-copy lesson learned elsewhere in this project for a
     # randomly initialized head), then a real EMA after that.
     teacher_classifier_layer = copy.deepcopy(model2.classifier_layer).to(device)
@@ -493,7 +490,7 @@ def main():
             sched2.step()
 
             # Backbone and head EMA share the SAME warmup window
-            # (--s2-head-warmup-iters) -- both hard-copy (momentum=0)
+            # (--s2-ema-warmup-iters) -- both hard-copy (momentum=0)
             # together at first, then both switch to their own real
             # momentum together. Giving the backbone a real momentum from
             # step 0 while the head hard-copies would leave Teacher2 as a
@@ -501,11 +498,9 @@ def main():
             # head for that whole window -- a mismatch, since the head is
             # trained (via TransferNet.forward()) against the LIVE
             # backbone's features, not the lagging EMA one.
-            in_head_warmup = s2_it_global < args.s2_head_warmup_iters
-            backbone_momentum = 0.0 if in_head_warmup else args.s2_ema_momentum
-            head_momentum = 0.0 if in_head_warmup else args.s2_head_ema_momentum
-            ema_update_teacher(model2.teacher_model, model2.base_network, backbone_momentum)
-            ema_update_teacher(teacher_classifier_layer, model2.classifier_layer, head_momentum)
+            ema_momentum = 0.0 if s2_it_global < args.s2_ema_warmup_iters else args.s2_ema_momentum
+            ema_update_teacher(model2.teacher_model, model2.base_network, ema_momentum)
+            ema_update_teacher(teacher_classifier_layer, model2.classifier_layer, ema_momentum)
             s2_it_global += 1
 
         logits1_x, feat_x1 = student1(image_x1)
