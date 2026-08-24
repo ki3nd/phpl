@@ -215,7 +215,7 @@ def main():
     parser.add_argument("--config-file", type=str, required=True)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--gpu", type=str, default="0")
-    parser.add_argument("--seed", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
 
     # Student 1 (PHPL) typically converges in ~750-1000 iterations; Student 2
     # (VLP-UDA-style, learning its classifier_layer from scratch) wants far
