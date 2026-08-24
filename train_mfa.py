@@ -387,9 +387,7 @@ def main():
     )
 
     s2_total_iters = args.s1_total_iters * args.s2_per_s1
-    s2_warmup_iters = args.warmup_iters * args.s2_per_s1
     s1_post_warmup = max(args.s1_total_iters - args.warmup_iters, 1)
-    s2_post_warmup = max(s2_total_iters - s2_warmup_iters, 1)
 
     # Student 1's cosine schedule spans its OWN post-warmup budget -- during
     # warmup, LR is held at a separate constant instead (see the loop below),
@@ -461,45 +459,49 @@ def main():
             logits2_u2 = student2_head(feat2_u2.float())
             pred2_u2 = F.softmax(logits2_u2, dim=1)
 
+            # Student 2's self/reg loss is IDENTICAL during and after warmup
+            # -- VLP-UDA's own recipe has no warmup concept at all, and
+            # Teacher2 (EMA) is already a stable, near-zero-shot reference
+            # from iteration 0 (no LoRA now, so it starts as an exact copy of
+            # pretrained CLIP, same as teacher_frozen would give). Only
+            # cross-teaching (Teacher1) is skipped during warmup -- Teacher1
+            # itself is still bootstrapping in this window (see Student 1's
+            # own warmup below), not a reliable reference yet.
+            #
+            # Self-loss reference is Teacher2's (EMA) cosine branch, NOT
+            # student2_backbone's own live one -- both are detached either
+            # way (no gradient flows through the self-loss reference
+            # regardless), so this only affects target stability: Teacher2's
+            # EMA-smoothed weights give a steadier target than the live
+            # student's (which shifts slightly every micro-step on a fresh
+            # batch) -- "temporal fusion" applied to Student2's self loss.
+            # reg_loss still trains student2_backbone's OWN cosine branch
+            # directly (pred_self2_clip_live, undetached) -- unaffected.
+            pred_self2_clip_live = F.softmax(logits2_u2_clip, dim=-1)
+            with torch.no_grad():
+                logits_self2_teacher, _ = teacher2_backbone(image_u2)
+                prob_self2 = F.softmax(logits_self2_teacher, dim=-1)
+
+            # Continuous ramp across the WHOLE run (including warmup) from
+            # iteration 0, matching VLP-UDA's own LambdaSheduler -- no reset
+            # at warmup's end.
+            lamb = 1.0 if args.s2_no_lamb_ramp else _cmkd_lamb(s2_it_global, s2_total_iters, args.s2_lamb_gamma)
+            loss_u2_self = _task_distill(pred2_u2, prob_self2, lamb)
+            # CMKD's own reg_loss (models/cmkd.py's regularization_term):
+            # trains the cosine branch itself directly -- CE on source with
+            # its true label, plus entropy-min on target.
+            reg_loss = (
+                args.s2_lambda2 * F.cross_entropy(logits2_x2_clip, label_x2)
+                + args.s2_lambda3 * lamb * _gini_impurity(pred_self2_clip_live)
+            )
+
             if in_warmup:
-                with torch.no_grad():
-                    logits_frozen_u2, _ = teacher_frozen(image_u2)
-                    prob_frozen_u2 = F.softmax(logits_frozen_u2, dim=-1)
-                loss_u2_self = args.s2_lambda1 * (
-                    _gini_impurity(pred2_u2, _calibrated_coefficient(pred2_u2, prob_frozen_u2))
-                    + _gini_impurity(
-                        0.5 * (pred2_u2 + prob_frozen_u2),
-                        1 - _calibrated_coefficient(pred2_u2, prob_frozen_u2),
-                    )
-                )
                 loss_u2_cross = torch.tensor(0.0, device=device)
-                reg_loss = torch.tensor(0.0, device=device)
-                loss2 = loss_x2 + loss_u2_self
-                lamb = 1.0  # no ramp during warmup -- there's only one (frozen) reference
+                loss2 = loss_x2 + loss_u2_self + reg_loss
             else:
-                # Self-loss reference is Teacher2's (EMA) cosine branch, NOT
-                # student2_backbone's own live one -- both are detached
-                # either way (no gradient flows through the self-loss
-                # reference regardless, see below), so swapping costs
-                # nothing on the gradient side, but Teacher2's EMA-smoothed
-                # weights give a more stable target than the live student's
-                # (which shifts slightly every micro-step on a fresh batch)
-                # -- the "temporal fusion" idea this whole architecture is
-                # built around, applied to Student2's self-loss too now.
-                # reg_loss still trains student2_backbone's OWN cosine branch
-                # directly (pred_self2_clip_live, undetached) -- unaffected.
-                pred_self2_clip_live = F.softmax(logits2_u2_clip, dim=-1)
                 with torch.no_grad():
-                    logits_self2_teacher, _ = teacher2_backbone(image_u2)
-                    prob_self2 = F.softmax(logits_self2_teacher, dim=-1)
                     logits_t1_u2, _ = teacher1(image_u2)
                     prob_cross2 = F.softmax(logits_t1_u2, dim=-1)
-
-                if args.s2_no_lamb_ramp:
-                    lamb = 1.0
-                else:
-                    lamb = _cmkd_lamb(s2_it_global - s2_warmup_iters, s2_post_warmup, args.s2_lamb_gamma)
-                loss_u2_self = _task_distill(pred2_u2, prob_self2, lamb)
                 if args.s2_cross_mode == "gini":
                     # CMKD's own task/distill formula, same as self, but with
                     # Teacher1 (naturally sharp -- logit_scale~100) as the
@@ -508,15 +510,6 @@ def main():
                 else:
                     # Student1-style CONFI=0.85 hard-threshold mask + CE.
                     loss_u2_cross = _masked_ce(logits2_u2, prob_cross2)
-
-                # CMKD's own reg_loss (models/cmkd.py's regularization_term):
-                # trains the cosine branch itself directly -- CE on source
-                # with its true label, plus entropy-min on target.
-                reg_loss = (
-                    args.s2_lambda2 * F.cross_entropy(logits2_x2_clip, label_x2)
-                    + args.s2_lambda3 * lamb * _gini_impurity(pred_self2_clip_live)
-                )
-
                 loss2 = loss_x2 + loss_u2_self + args.s2_cross_weight * loss_u2_cross + reg_loss
 
             optim2.zero_grad()
