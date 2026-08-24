@@ -440,7 +440,18 @@ def main():
             clf_loss, transfer_loss = model2(data_x2, data_u2, label_x2)
             loss2_self = clf_loss + transfer_loss
 
-            if in_warmup:
+            if in_warmup or args.s2_cross_weight == 0.0:
+                # Skipping the predict() call entirely (not just zero-
+                # weighting its result) when cross-teaching is off matters:
+                # model2.predict() is an EXTRA forward through
+                # classifier_layer beyond what TransferNet.forward() already
+                # does (source + target), and classifier_layer.train() means
+                # its BatchNorm1d mutates running_mean/running_var on every
+                # call regardless of what weight is later applied to the
+                # loss that consumes it -- multiplying by 0.0 zeroes the
+                # GRADIENT but not this side effect. With --s2-cross-weight
+                # 0.0, this keeps Student2 bit-for-bit on the same BatchNorm
+                # statistics trajectory as a standalone VLP-UDA run.
                 loss2_cross = torch.tensor(0.0, device=device)
                 loss2 = loss2_self
             else:
