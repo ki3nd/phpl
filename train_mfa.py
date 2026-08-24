@@ -55,6 +55,10 @@ import os.path as osp
 import torch
 import yaml
 from torch.nn import functional as F
+from torchvision.transforms import (
+    Compose, Normalize, RandomCrop, RandomHorizontalFlip, Resize, ToTensor,
+)
+from torchvision.transforms.functional import InterpolationMode
 
 from dassl.data import DataManager
 from dassl.utils import mkdir_if_missing, set_random_seed
@@ -334,6 +338,19 @@ def main():
     # naturally gives Student 2 exactly 1000 warmup micro-iterations too.
     parser.add_argument("--warmup-iters", type=int, default=100)
 
+    # Both students share ONE DataManager/transform (see below) -- there's no
+    # way to give Student 2 VLP-UDA's own augmentation without also changing
+    # Student 1's (which is already learning well on dassl's default
+    # random_resized_crop). This flag switches BOTH to VLP-UDA's own
+    # augmentation as an experiment (off by default -- dassl's current
+    # transform, unchanged, for both).
+    parser.add_argument("--vlpuda-augment", action="store_true",
+                         help="use VLP-UDA's own train/test transforms (Resize(256,256)->"
+                              "RandomCrop(224)->RandomHorizontalFlip, bilinear; test: direct "
+                              "Resize(224,224), no CenterCrop) for BOTH students, instead of "
+                              "dassl's default (random_resized_crop scale=(0.08,1.0), bicubic; "
+                              "test: Resize+CenterCrop)")
+
     _load_hparams_as_defaults(parser, parser.parse_known_args()[0].hparams_config)
     args = parser.parse_args()
     cfg = build_cfg(args)
@@ -344,7 +361,25 @@ def main():
         set_random_seed(cfg.SEED)
 
     print("Building data loaders")
-    dm = DataManager(cfg)
+    if args.vlpuda_augment:
+        print("Using VLP-UDA's own train/test transforms (--vlpuda-augment)")
+        normalize = Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD)
+        crop_size = cfg.INPUT.SIZE[0]
+        tfm_train = Compose([
+            Resize([256, 256], interpolation=InterpolationMode.BILINEAR),
+            RandomCrop(crop_size),
+            RandomHorizontalFlip(),
+            ToTensor(),
+            normalize,
+        ])
+        tfm_test = Compose([
+            Resize([crop_size, crop_size], interpolation=InterpolationMode.BILINEAR),
+            ToTensor(),
+            normalize,
+        ])
+        dm = DataManager(cfg, custom_tfm_train=tfm_train, custom_tfm_test=tfm_test)
+    else:
+        dm = DataManager(cfg)
     train_loader_x = CyclingLoader(dm.train_loader_x)
     train_loader_u = CyclingLoader(dm.train_loader_u)
     test_loader = dm.test_loader
