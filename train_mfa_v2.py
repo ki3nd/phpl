@@ -258,6 +258,9 @@ def main():
 
     _load_hparams_as_defaults(parser, parser.parse_known_args()[0].hparams_config)
     args = parser.parse_args()
+    print("Resolved args (CLI overrides applied on top of --hparams-config defaults):")
+    for k, v in sorted(vars(args).items()):
+        print(f"  {k} = {v}")
     cfg = build_cfg(args)
     device = torch.device(f"cuda:{cfg.GPU}" if torch.cuda.is_available() else "cpu")
     mkdir_if_missing(args.output_dir)
