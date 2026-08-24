@@ -2,9 +2,10 @@
 # --hparams-config and applied as argparse defaults -- any flag passed
 # explicitly on the command line still overrides the value here.
 #
-# Student 1 (PHPL-style, LoRA) is a straight mirror of the CLI defaults it
-# already had before this file existed -- DO NOT change these without
-# re-testing, it's the branch that's already learning well.
+# Student 1 (PHPL-style, LoRA). Was a straight mirror of the pre-existing
+# CLI defaults; ema_momentum has since been retuned to 0.99 (tested,
+# confirmed better than 0.996) -- the rest is still the untouched original,
+# don't change further without re-testing.
 s1:
   lr: 0.0035
   momentum: 0.9
