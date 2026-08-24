@@ -15,11 +15,12 @@ s1:
 
 # Student 2 -- now the REAL vlpuda_pure/models/make_model.py TransferNet +
 # models/cmkd.py CMKD, not a reimplementation. Values match VLP-UDA's own
-# configs/office_home.yaml (ViT-B). No lamb_gamma/no_lamb_ramp/head_* here --
-# CMKD's own LambdaSheduler (gamma=1.0, fixed, not exposed as a CLI knob in
-# the real code) and there's no separate classifier-head EMA in vlpuda_pure's
-# design (only base_network gets a teacher_model copy) -- see
-# vlpuda_pure/utils/tools.py's ema_update_teacher.
+# configs/office_home.yaml (ViT-B). No lamb_gamma/no_lamb_ramp here -- CMKD's
+# own LambdaSheduler (gamma=1.0, fixed, not exposed as a CLI knob in the real
+# code). vlpuda_pure's own design has no classifier-head EMA at all (only
+# base_network gets a teacher_model copy) -- this project adds one anyway
+# (teacher_classifier_layer, see train_mfa_v2.py), hence head_ema_momentum/
+# head_warmup_iters below, matching train_mfa.py's own teacher2_head pattern.
 s2:
   lr: 3.0e-6
   multiple_lr_classifier: 1000
@@ -34,3 +35,5 @@ s2:
   cross_weight: 0.5
   cross_mode: mask
   ema_momentum: 0.99
+  head_ema_momentum: 0.99
+  head_warmup_iters: 100

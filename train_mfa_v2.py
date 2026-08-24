@@ -28,18 +28,23 @@ DataManager. Student 2 / Teacher 2 now:
     (models/make_model.py) was hard-copied at init but NEVER updated in
     the original codebase (only read by --rst) -- vlpuda_pure/utils/
     tools.py's ema_update_teacher (added in this project) gives it a real
-    EMA update every Student 2 micro-iteration. There's no separate
-    classifier-head EMA in vlpuda_pure's own design (only one
-    classifier_layer exists), so "Teacher2" = EMA-backbone features fed
-    through the SAME (live) classifier_layer.
+    EMA update every Student 2 micro-iteration. vlpuda_pure's own design
+    has no separate classifier-head EMA at all (only one classifier_layer
+    exists) -- this project adds one anyway (teacher_classifier_layer, a
+    deepcopy of model2.classifier_layer, EMA'd the same way, hard-copied
+    for --s2-head-warmup-iters first since it starts freshly initialized
+    like train_mfa.py's own teacher2_head), so "Teacher2" = EMA-backbone
+    features fed through this separate EMA head, not the live one.
   - Data: Student 2's OWN training loader is vlpuda_pure's native
-    utils/data_loader.py (real ImageFolder + real transforms), entirely
-    separate from Student 1's dassl DataManager -- each branch has its
-    own independent loader (see train_mfa.py's own loader-independence
-    fix; same principle applies here, just with two DIFFERENT loading
-    mechanisms instead of two instances of the same one). evaluate() uses
-    ONE shared dassl test_loader for BOTH branches, so Teacher1/Teacher2
-    are compared/ensembled on the exact same image each time.
+    utils/data_loader.py (real ImageFolder + real transforms). Student 1's
+    dassl DataManager uses the SAME transform (VLP-UDA's own, always-on
+    here -- see the custom_tfm_train/custom_tfm_test built in main());
+    each branch still has its own independent loader instance (see
+    train_mfa.py's own loader-independence fix; same principle here, just
+    with two DIFFERENT loading mechanisms instead of two instances of the
+    same one). evaluate() uses ONE shared dassl test_loader for BOTH
+    branches, so Teacher1/Teacher2 are compared/ensembled on the exact
+    same image each time.
 
 vlpuda_pure/'s own top-level package names (`models`, `utils`, `clip`)
 collide with this project's own same-named packages -- see
@@ -55,6 +60,7 @@ Usage:
         --s1-total-iters 1000 --s2-per-s1 10 --print-freq 50 --eval-freq 200
 """
 import argparse
+import copy
 import importlib
 import os.path as osp
 import sys
@@ -62,6 +68,10 @@ import sys
 import torch
 import yaml
 from torch.nn import functional as F
+from torchvision.transforms import (
+    Compose, Normalize, RandomCrop, RandomHorizontalFlip, Resize, ToTensor,
+)
+from torchvision.transforms.functional import InterpolationMode
 
 from dassl.data import DataManager
 from dassl.utils import mkdir_if_missing, set_random_seed
@@ -176,11 +186,11 @@ def _build_lora_pair(cfg, is_vit, classnames, device):
 
 
 @torch.no_grad()
-def evaluate(teacher1, model2, test_loader, device):
-    """Both Teacher1 and "Teacher2" (model2.teacher_model's EMA backbone
-    features through model2's LIVE classifier_layer -- vlpuda_pure has no
-    separate classifier-head EMA) look at the exact same image each batch
-    (ONE shared dassl test_loader), so the ensemble is a fair average."""
+def evaluate(teacher1, model2, teacher_classifier_layer, test_loader, device):
+    """Both Teacher1 and Teacher2 (model2.teacher_model's EMA backbone
+    features through teacher_classifier_layer, its own EMA head) look at
+    the exact same image each batch (ONE shared dassl test_loader), so the
+    ensemble is a fair average."""
     correct1, correct2, correct_ens, total = 0, 0, 0, 0
     for batch in test_loader:
         image = batch["img"].to(device)
@@ -190,7 +200,7 @@ def evaluate(teacher1, model2, test_loader, device):
         prob1 = F.softmax(logits1, dim=-1)
 
         feat2_teacher = model2.teacher_model.forward_features(image)
-        logits2 = model2.classifier_layer(feat2_teacher)
+        logits2 = teacher_classifier_layer(feat2_teacher)
         prob2 = F.softmax(logits2, dim=-1)
 
         prob_ens = 0.5 * (prob1 + prob2)
@@ -251,8 +261,15 @@ def main():
                               "(NOT part of CMKD -- added on top, same as train_mfa.py)")
     parser.add_argument("--s2-cross-mode", choices=["mask", "gini"], default="mask")
     parser.add_argument("--s2-ema-momentum", type=float, default=0.99,
-                         help="EMA momentum for model2.teacher_model (vlpuda_pure's own "
-                              "ema_update_teacher) -- no separate classifier-head EMA exists")
+                         help="EMA momentum for model2.teacher_model (backbone), via "
+                              "vlpuda_pure's own ema_update_teacher")
+    parser.add_argument("--s2-head-ema-momentum", type=float, default=0.99,
+                         help="EMA momentum for teacher_classifier_layer, active AFTER "
+                              "--s2-head-warmup-iters")
+    parser.add_argument("--s2-head-warmup-iters", type=int, default=100,
+                         help="teacher_classifier_layer hard-copies model2.classifier_layer "
+                              "every step for this many iterations (momentum=0) before "
+                              "switching to --s2-head-ema-momentum")
     parser.add_argument("--s2-batch-size", type=int, default=32)
     parser.add_argument("--s2-num-workers", type=int, default=8)
 
@@ -268,8 +285,27 @@ def main():
     if cfg.SEED >= 0:
         set_random_seed(cfg.SEED)
 
-    print("Building Student1/Teacher1's data loader (dassl)")
-    dm1 = DataManager(cfg)
+    print("Building Student1/Teacher1's data loader (dassl, VLP-UDA-style transform)")
+    # v2's whole point is fidelity to VLP-UDA -- Student2's own loader already
+    # uses their native transform unconditionally (utils/data_loader.py), so
+    # Student1's dassl loader gets the SAME transform here too (matching
+    # train_mfa.py's --vlpuda-augment, just always-on instead of a flag,
+    # since there's no "compare against dassl's own aug" motive in v2).
+    _normalize = Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD)
+    _crop_size = cfg.INPUT.SIZE[0]
+    _tfm_train = Compose([
+        Resize([256, 256], interpolation=InterpolationMode.BILINEAR),
+        RandomCrop(_crop_size),
+        RandomHorizontalFlip(),
+        ToTensor(),
+        _normalize,
+    ])
+    _tfm_test = Compose([
+        Resize([_crop_size, _crop_size], interpolation=InterpolationMode.BILINEAR),
+        ToTensor(),
+        _normalize,
+    ])
+    dm1 = DataManager(cfg, custom_tfm_train=_tfm_train, custom_tfm_test=_tfm_test)
     train_loader_x1 = CyclingLoader(dm1.train_loader_x)
     train_loader_u1 = CyclingLoader(dm1.train_loader_u)
     test_loader = dm1.test_loader
@@ -314,6 +350,17 @@ def main():
 
     print("Building Student2/Teacher2 (vlpuda_pure's own TransferNet)")
     model2 = TransferNet(vlpuda_args, train=True).to(device)
+    # vlpuda_pure's own design has no classifier-head EMA at all (only
+    # base_network gets a teacher_model copy) -- the classifier head needs
+    # its own teacher too, same as train_mfa.py's teacher2_head, since it's
+    # a freshly-initialized (near-random, small-std) module just like
+    # there. Hard-copied every step for --s2-head-warmup-iters (mirrors the
+    # epoch-1 hard-copy lesson learned elsewhere in this project for a
+    # randomly initialized head), then a real EMA after that.
+    teacher_classifier_layer = copy.deepcopy(model2.classifier_layer).to(device)
+    for param in teacher_classifier_layer.parameters():
+        param.requires_grad_(False)
+    teacher_classifier_layer.eval()
 
     optim1 = torch.optim.SGD(
         [p for p in student1.parameters() if p.requires_grad],
@@ -366,10 +413,11 @@ def main():
                 logits_cross_for_s1, _ = teacher_frozen(image_u1)
             else:
                 # "Teacher2" for Student1's cross term: EMA backbone
-                # (model2.teacher_model) through the LIVE classifier_layer
-                # (no separate head EMA exists in vlpuda_pure's design).
+                # (model2.teacher_model) through its own EMA head
+                # (teacher_classifier_layer) -- both are temporal-fusion
+                # EMAs now, no live parameters involved on Teacher2's side.
                 feat_cross_for_s1 = model2.teacher_model.forward_features(image_u1)
-                logits_cross_for_s1 = model2.classifier_layer(feat_cross_for_s1)
+                logits_cross_for_s1 = teacher_classifier_layer(feat_cross_for_s1)
             prob_cross_for_s1 = F.softmax(logits_cross_for_s1, dim=-1)
 
         for _ in range(args.s2_per_s1):
@@ -416,6 +464,8 @@ def main():
             sched2.step()
 
             ema_update_teacher(model2.teacher_model, model2.base_network, args.s2_ema_momentum)
+            head_momentum = 0.0 if s2_it_global < args.s2_head_warmup_iters else args.s2_head_ema_momentum
+            ema_update_teacher(teacher_classifier_layer, model2.classifier_layer, head_momentum)
             s2_it_global += 1
 
         logits1_x, feat_x1 = student1(image_x1)
@@ -466,7 +516,7 @@ def main():
 
         if (macro + 1) % args.eval_freq == 0 or (macro + 1) == args.s1_total_iters or (macro + 1) == args.warmup_iters:
             model2.eval()
-            acc1, acc2, acc_ens = evaluate(teacher1, model2, test_loader, device)
+            acc1, acc2, acc_ens = evaluate(teacher1, model2, teacher_classifier_layer, test_loader, device)
             tag = " [end of warmup]" if (macro + 1) == args.warmup_iters else ""
             print(f"[eval] macro {macro + 1}{tag}: Teacher1 {acc1:.2f}% | Teacher2 {acc2:.2f}% | Ensemble {acc_ens:.2f}%")
 
