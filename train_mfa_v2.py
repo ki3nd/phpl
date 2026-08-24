@@ -35,16 +35,16 @@ DataManager. Student 2 / Teacher 2 now:
     for --s2-head-warmup-iters first since it starts freshly initialized
     like train_mfa.py's own teacher2_head), so "Teacher2" = EMA-backbone
     features fed through this separate EMA head, not the live one.
-  - Data: Student 2's OWN training loader is vlpuda_pure's native
-    utils/data_loader.py (real ImageFolder + real transforms). Student 1's
-    dassl DataManager uses the SAME transform (VLP-UDA's own, always-on
-    here -- see the custom_tfm_train/custom_tfm_test built in main());
-    each branch still has its own independent loader instance (see
-    train_mfa.py's own loader-independence fix; same principle here, just
-    with two DIFFERENT loading mechanisms instead of two instances of the
-    same one). evaluate() uses ONE shared dassl test_loader for BOTH
-    branches, so Teacher1/Teacher2 are compared/ensembled on the exact
-    same image each time.
+  - Data: both branches use dassl's own DataManager (each its own SEPARATE
+    instance, own independent shuffled stream -- see train_mfa.py's own
+    loader-independence fix), with VLP-UDA's own transform (Resize(256,256)
+    -> RandomCrop(224) -> RandomHorizontalFlip, bilinear; test: direct
+    Resize, no CenterCrop) always on for both, matching train_mfa.py's
+    --vlpuda-augment. dassl reads the exact same on-disk class-subfolder
+    layout vlpuda_pure's own ImageFolder-based loader would, so this needed
+    no changes to how the dataset is organized on disk. evaluate() uses ONE
+    shared test_loader for BOTH branches, so Teacher1/Teacher2 are
+    compared/ensembled on the exact same image each time.
 
 vlpuda_pure/'s own top-level package names (`models`, `utils`, `clip`)
 collide with this project's own same-named packages -- see
@@ -110,7 +110,6 @@ def _import_vlpuda_pure():
     sys.path.insert(0, _VLPUDA_DIR)
     try:
         make_model = importlib.import_module("models.make_model")
-        data_loader = importlib.import_module("utils.data_loader")
         tools = importlib.import_module("utils.tools")
     finally:
         sys.path[:] = saved_path
@@ -118,20 +117,12 @@ def _import_vlpuda_pure():
             del sys.modules[k]
         sys.modules.update(saved_modules)
 
-    return make_model, data_loader, tools
+    return make_model, tools
 
 
-_vlpuda_make_model, _vlpuda_data_loader, _vlpuda_tools = _import_vlpuda_pure()
+_vlpuda_make_model, _vlpuda_tools = _import_vlpuda_pure()
 TransferNet = _vlpuda_make_model.TransferNet
 ema_update_teacher = _vlpuda_tools.ema_update_teacher
-
-# dassl's own OfficeHome domain-folder names (lowercase, matches what's
-# already on disk for Student 1 -- see dassl/data/datasets/da/office_home.py
-# and train.py's own DOMAINS dict), NOT VLP-UDA README's capitalized
-# convention (their own default download uses "Art"/"Clipart"/etc., but
-# this project's actual data directory already uses the lowercase dassl
-# names since Student 1 depends on it).
-_OFFICEHOME_DOMAINS = {"a": "art", "c": "clipart", "p": "product", "r": "real_world"}
 
 
 def _load_hparams_as_defaults(parser, path):
@@ -272,9 +263,20 @@ def main():
                               "switching to --s2-head-ema-momentum")
     parser.add_argument("--s2-batch-size", type=int, default=32)
     parser.add_argument("--s2-num-workers", type=int, default=8)
+    parser.add_argument("--disable-s1", action="store_true",
+                         help="Train Student2 alone, with NOTHING from dassl (no Student1, "
+                              "no shared test_loader) -- to check Student2 in isolation "
+                              "against a standalone VLP-UDA run. Forces --s2-cross-weight to "
+                              "0.0 regardless of what's set (there's no Teacher1 to cross-teach "
+                              "from/to), and evaluate()s on vlpuda_pure's own native "
+                              "target_test_loader instead of dassl's, reporting Teacher2 only.")
 
     _load_hparams_as_defaults(parser, parser.parse_known_args()[0].hparams_config)
     args = parser.parse_args()
+    if args.disable_s1 and args.s2_cross_weight != 0.0:
+        print(f"--disable-s1: forcing --s2-cross-weight 0.0 (was {args.s2_cross_weight}) -- "
+              f"no Teacher1 exists to cross-teach with")
+        args.s2_cross_weight = 0.0
     print("Resolved args (CLI overrides applied on top of --hparams-config defaults):")
     for k, v in sorted(vars(args).items()):
         print(f"  {k} = {v}")
@@ -286,11 +288,12 @@ def main():
         set_random_seed(cfg.SEED)
 
     print("Building Student1/Teacher1's data loader (dassl, VLP-UDA-style transform)")
-    # v2's whole point is fidelity to VLP-UDA -- Student2's own loader already
-    # uses their native transform unconditionally (utils/data_loader.py), so
-    # Student1's dassl loader gets the SAME transform here too (matching
-    # train_mfa.py's --vlpuda-augment, just always-on instead of a flag,
-    # since there's no "compare against dassl's own aug" motive in v2).
+    # Both branches use dassl's own DataManager (each its own SEPARATE
+    # instance -- see dm2 below -- own independent shuffled stream, same
+    # principle as train_mfa.py's loader-independence fix), with VLP-UDA's
+    # own transform (matching train_mfa.py's --vlpuda-augment, just
+    # always-on instead of a flag, since v2's whole point is fidelity to
+    # VLP-UDA and there's no "compare against dassl's own aug" motive here).
     _normalize = Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD)
     _crop_size = cfg.INPUT.SIZE[0]
     _tfm_train = Compose([
@@ -316,10 +319,16 @@ def main():
     print("Building Student1/Teacher1 (PHPL-style)")
     student1, teacher1, lora1_s, lora1_t = _build_lora_pair(cfg, is_vit, classnames, device)
 
-    print("Building Student2/Teacher2's data loader (vlpuda_pure's own, native)")
-    src_letter, tgt_letter = args.domains.split("-")
-    folder_src = osp.join(cfg.DATASET.ROOT, "office_home", _OFFICEHOME_DOMAINS[src_letter])
-    folder_tgt = osp.join(cfg.DATASET.ROOT, "office_home", _OFFICEHOME_DOMAINS[tgt_letter])
+    print("Building Student2/Teacher2's data loader (dassl, same VLP-UDA-style transform)")
+    # Per user's explicit request: keep using dassl's DataManager for
+    # Student 2 too (their on-disk folder layout is already set up for it,
+    # and it reads the exact same class-subfolder convention vlpuda_pure's
+    # own ImageFolder-based loader would anyway) -- just with a SEPARATE
+    # instance from dm1 (own independent shuffled stream, same principle as
+    # train_mfa.py's loader-independence fix), same transform as dm1 above.
+    dm2 = DataManager(cfg, custom_tfm_train=_tfm_train, custom_tfm_test=_tfm_test)
+    train_loader_x2 = CyclingLoader(dm2.train_loader_x)
+    train_loader_u2 = CyclingLoader(dm2.train_loader_u)
 
     s2_total_iters = args.s1_total_iters * args.s2_per_s1
     vlpuda_args = argparse.Namespace(
@@ -337,16 +346,6 @@ def main():
         multiple_lr_classifier=args.s2_multiple_lr_classifier,
         max_iter=s2_total_iters,
     )
-    train_loader_x2, _ = _vlpuda_data_loader.load_data(
-        vlpuda_args, folder_src, args.s2_batch_size, infinite_data_loader=True,
-        train=True, num_workers=args.s2_num_workers,
-    )
-    train_loader_u2, _ = _vlpuda_data_loader.load_data(
-        vlpuda_args, folder_tgt, args.s2_batch_size, infinite_data_loader=True,
-        train=True, num_workers=args.s2_num_workers,
-    )
-    iter_x2 = iter(train_loader_x2)
-    iter_u2 = iter(train_loader_u2)
 
     print("Building Student2/Teacher2 (vlpuda_pure's own TransferNet)")
     model2 = TransferNet(vlpuda_args, train=True).to(device)
@@ -402,6 +401,15 @@ def main():
     for macro in range(args.s1_total_iters):
         in_warmup = macro < args.warmup_iters
 
+        if not in_warmup and teacher_frozen is not None:
+            # teacher_frozen is only ever read inside `if in_warmup:` blocks
+            # -- once warmup ends it's dead weight (a whole extra CLIP model)
+            # sitting on the GPU for the rest of the run. Free it right here
+            # instead of holding it until the process exits.
+            del teacher_frozen, clip_frozen
+            teacher_frozen = None
+            torch.cuda.empty_cache()
+
         batch_x1 = train_loader_x1.next()
         batch_u1 = train_loader_u1.next()
         image_x1 = batch_x1["img"].to(device)
@@ -421,9 +429,11 @@ def main():
             prob_cross_for_s1 = F.softmax(logits_cross_for_s1, dim=-1)
 
         for _ in range(args.s2_per_s1):
-            data_x2, label_x2 = next(iter_x2)
-            data_u2, _ = next(iter_u2)
-            data_x2, label_x2, data_u2 = data_x2.to(device), label_x2.to(device), data_u2.to(device)
+            batch_x2 = train_loader_x2.next()
+            batch_u2 = train_loader_u2.next()
+            data_x2 = batch_x2["img"].to(device)
+            label_x2 = batch_x2["label"].to(device)
+            data_u2 = batch_u2["img"].to(device)
 
             # model2.train() would ALSO flip teacher_model into train mode
             # (nn.Module.train() recurses into every submodule) -- it must
