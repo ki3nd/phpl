@@ -31,10 +31,14 @@ DataManager. Student 2 / Teacher 2 now:
     EMA update every Student 2 micro-iteration. vlpuda_pure's own design
     has no separate classifier-head EMA at all (only one classifier_layer
     exists) -- this project adds one anyway (teacher_classifier_layer, a
-    deepcopy of model2.classifier_layer, EMA'd the same way, hard-copied
-    for --s2-head-warmup-iters first since it starts freshly initialized
-    like train_mfa.py's own teacher2_head), so "Teacher2" = EMA-backbone
-    features fed through this separate EMA head, not the live one.
+    deepcopy of model2.classifier_layer), so "Teacher2" = EMA-backbone
+    features fed through this separate EMA head, not the live one. Both
+    the backbone's and the head's EMA share the SAME --s2-head-warmup-iters
+    window (hard-copy together, then switch to their own real momentum
+    together) -- otherwise Teacher2 would be a smoothed backbone paired
+    with an instantaneously-tracking head (or vice versa) during that
+    window, since the head is trained against the LIVE backbone's
+    features, not the lagging EMA one.
   - Data: both branches use dassl's own DataManager (each its own SEPARATE
     instance, own independent shuffled stream -- see train_mfa.py's own
     loader-independence fix), with VLP-UDA's own transform (Resize(256,256)
@@ -252,15 +256,19 @@ def main():
                               "(NOT part of CMKD -- added on top, same as train_mfa.py)")
     parser.add_argument("--s2-cross-mode", choices=["mask", "gini"], default="mask")
     parser.add_argument("--s2-ema-momentum", type=float, default=0.99,
-                         help="EMA momentum for model2.teacher_model (backbone), via "
-                              "vlpuda_pure's own ema_update_teacher")
+                         help="EMA momentum for model2.teacher_model (backbone), active AFTER "
+                              "--s2-head-warmup-iters (same warmup window as the head, so "
+                              "both switch from hard-copy to real EMA together)")
     parser.add_argument("--s2-head-ema-momentum", type=float, default=0.99,
                          help="EMA momentum for teacher_classifier_layer, active AFTER "
                               "--s2-head-warmup-iters")
     parser.add_argument("--s2-head-warmup-iters", type=int, default=100,
-                         help="teacher_classifier_layer hard-copies model2.classifier_layer "
-                              "every step for this many iterations (momentum=0) before "
-                              "switching to --s2-head-ema-momentum")
+                         help="BOTH teacher_model and teacher_classifier_layer hard-copy "
+                              "model2.base_network/classifier_layer every step for this many "
+                              "iterations (momentum=0) before switching to their own real EMA "
+                              "momentum -- kept in sync so Teacher2 is never a smoothed "
+                              "backbone paired with an instantaneously-tracking head or vice "
+                              "versa")
     parser.add_argument("--s2-batch-size", type=int, default=32)
     parser.add_argument("--s2-num-workers", type=int, default=8)
     parser.add_argument("--disable-s1", action="store_true",
@@ -484,8 +492,19 @@ def main():
             optim2.step()
             sched2.step()
 
-            ema_update_teacher(model2.teacher_model, model2.base_network, args.s2_ema_momentum)
-            head_momentum = 0.0 if s2_it_global < args.s2_head_warmup_iters else args.s2_head_ema_momentum
+            # Backbone and head EMA share the SAME warmup window
+            # (--s2-head-warmup-iters) -- both hard-copy (momentum=0)
+            # together at first, then both switch to their own real
+            # momentum together. Giving the backbone a real momentum from
+            # step 0 while the head hard-copies would leave Teacher2 as a
+            # smoothed backbone paired with an instantaneously-tracking
+            # head for that whole window -- a mismatch, since the head is
+            # trained (via TransferNet.forward()) against the LIVE
+            # backbone's features, not the lagging EMA one.
+            in_head_warmup = s2_it_global < args.s2_head_warmup_iters
+            backbone_momentum = 0.0 if in_head_warmup else args.s2_ema_momentum
+            head_momentum = 0.0 if in_head_warmup else args.s2_head_ema_momentum
+            ema_update_teacher(model2.teacher_model, model2.base_network, backbone_momentum)
             ema_update_teacher(teacher_classifier_layer, model2.classifier_layer, head_momentum)
             s2_it_global += 1
 
