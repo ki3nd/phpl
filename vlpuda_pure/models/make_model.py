@@ -47,7 +47,7 @@ class TransferNet(nn.Module):
             self.clf_loss = torch.nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
     def forward(self, source, target_img, source_label, target_strong=None, label_set=None,
-                self_ref_logit_clip=None):
+                self_ref_logit_clip=None, own_pred_target_img=None):
         self.base_network.apply(fix_bn)
         source = self.base_network.forward_features(source)
 
@@ -62,7 +62,16 @@ class TransferNet(nn.Module):
 
             # calculate calibrated probability alignment loss Lcpa
             target_clip_logits = self.base_network.forward_head(target)
-            target_logits = self.classifier_layer(target)
+            # own_pred_target_img (--strong-aug in train_mfa_v2.py): the
+            # classifier's OWN prediction (fed into self+cross loss) can
+            # come from a DIFFERENT (harder-augmented) view than the one
+            # target_clip_logits/reg_loss above use -- an EXTRA full
+            # backbone forward pass when provided (gradient-carrying, since
+            # this needs to train the classifier). Defaults to None, i.e.
+            # the original single-view behavior (own prediction from the
+            # SAME target as everything else here).
+            own_feat = target if own_pred_target_img is None else self.base_network.forward_features(own_pred_target_img)
+            target_logits = self.classifier_layer(own_feat)
 
             # calculate calibrated gini impurity loss Lcgi
             transfer_loss = self.cmkd(target_logits, target_clip_logits, source_logits_clip, source_label,label_set,

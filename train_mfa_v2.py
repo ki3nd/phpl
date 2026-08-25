@@ -77,7 +77,8 @@ import torch
 import yaml
 from torch.nn import functional as F
 from torchvision.transforms import (
-    Compose, Normalize, RandomCrop, RandomHorizontalFlip, Resize, ToTensor,
+    ColorJitter, Compose, Normalize, RandomCrop, RandomHorizontalFlip,
+    RandomResizedCrop, Resize, ToTensor,
 )
 from torchvision.transforms.functional import InterpolationMode
 
@@ -280,6 +281,25 @@ def main():
                               "versa")
     parser.add_argument("--s2-batch-size", type=int, default=32)
     parser.add_argument("--s2-num-workers", type=int, default=8)
+    parser.add_argument("--strong-aug", action="store_true",
+                         help="FixMatch-style weak/strong split for the TARGET (unlabeled) "
+                              "image stream, for BOTH branches: teachers/self-reference/cross-"
+                              "reference keep seeing the current (weak) view unchanged; each "
+                              "student's OWN forward (whose output feeds self+cross loss) sees "
+                              "a mildly harder 'strong' view instead (slightly more aggressive "
+                              "crop + light color jitter -- NOT VLP-UDA's own ColorJitter(0.4)+"
+                              "RandAugment(m10) fixmatch recipe, which is CIFAR/ImageNet-CNN-"
+                              "scale aggressive and risks knocking CLIP's own pretrained "
+                              "semantics off-distribution). Off by default -- when on, Student2 "
+                              "gets an EXTRA full-gradient backbone forward pass per micro-"
+                              "iteration (the strong view, on top of the weak one already used "
+                              "for its self-reference/reg_loss) -- this is the same shape of "
+                              "cost that caused the earlier OOM (removed then, reintroduced "
+                              "here on purpose) -- reduce --s2-batch-size if it OOMs again. "
+                              "Student1 (LoRA) has no such cost -- just swaps which image its "
+                              "own forward call uses, for free. evaluate() is entirely "
+                              "unaffected (test_loader keeps its own separate, deterministic "
+                              "transform, never touched by this flag).")
     parser.add_argument("--disable-s1", action="store_true",
                          help="Train Student2 alone, with NOTHING from dassl (no Student1, "
                               "no shared test_loader) -- to check Student2 in isolation "
@@ -325,7 +345,27 @@ def main():
         ToTensor(),
         _normalize,
     ])
-    dm1 = DataManager(cfg, custom_tfm_train=_tfm_train, custom_tfm_test=_tfm_test)
+    # --strong-aug: mild "strong" view (a bit more aggressive crop + light
+    # color jitter -- NOT VLP-UDA's own ColorJitter(0.4)+RandAugment(m10)
+    # fixmatch recipe, deliberately toned down for a CLIP-pretrained model,
+    # see the flag's own help text). dassl's DatasetWrapper natively
+    # supports a LIST of transforms -- each produces its own output["img"],
+    # output["img2"], ... key, no custom dataset wrapper needed. This list
+    # is used for BOTH train_x and train_u (dassl applies the same
+    # transform list to both loaders) -- img2 is simply unused for train_x
+    # (source), no behavior change there.
+    if args.strong_aug:
+        _tfm_strong = Compose([
+            RandomResizedCrop(_crop_size, scale=(0.5, 1.0), interpolation=InterpolationMode.BILINEAR),
+            RandomHorizontalFlip(),
+            ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.0),
+            ToTensor(),
+            _normalize,
+        ])
+        _tfm_train_list = [_tfm_train, _tfm_strong]
+    else:
+        _tfm_train_list = _tfm_train
+    dm1 = DataManager(cfg, custom_tfm_train=_tfm_train_list, custom_tfm_test=_tfm_test)
     train_loader_x1 = CyclingLoader(dm1.train_loader_x)
     train_loader_u1 = CyclingLoader(dm1.train_loader_u)
     test_loader = dm1.test_loader
@@ -343,7 +383,7 @@ def main():
     # own ImageFolder-based loader would anyway) -- just with a SEPARATE
     # instance from dm1 (own independent shuffled stream, same principle as
     # train_mfa.py's loader-independence fix), same transform as dm1 above.
-    dm2 = DataManager(cfg, custom_tfm_train=_tfm_train, custom_tfm_test=_tfm_test)
+    dm2 = DataManager(cfg, custom_tfm_train=_tfm_train_list, custom_tfm_test=_tfm_test)
     train_loader_x2 = CyclingLoader(dm2.train_loader_x)
     train_loader_u2 = CyclingLoader(dm2.train_loader_u)
 
@@ -431,7 +471,14 @@ def main():
         batch_u1 = train_loader_u1.next()
         image_x1 = batch_x1["img"].to(device)
         label_x1 = batch_x1["label"].to(device)
+        # weak = current/default view, used for every TEACHER-side
+        # computation below (self-reference, cross-reference) -- unchanged.
+        # strong = --strong-aug's mildly harder view, used ONLY for
+        # Student1's OWN forward further down (feeds both self+cross loss)
+        # -- free for Student1 (LoRA), just swaps which image tensor its
+        # forward call uses, no extra pass.
         image_u1 = batch_u1["img"].to(device)
+        image_u1_strong = batch_u1["img2"].to(device) if args.strong_aug else image_u1
 
         with torch.no_grad():
             if in_warmup:
@@ -451,6 +498,12 @@ def main():
             data_x2 = batch_x2["img"].to(device)
             label_x2 = batch_x2["label"].to(device)
             data_u2 = batch_u2["img"].to(device)
+            # weak (data_u2) feeds every TEACHER-side computation below
+            # (self-reference, reg_loss, cross-reference to Teacher1) --
+            # unchanged. strong feeds ONLY the classifier's own prediction
+            # (own_pred_target_img below) -- see --strong-aug's own help
+            # text for the OOM-risk tradeoff this reintroduces here.
+            data_u2_strong = batch_u2["img2"].to(device) if args.strong_aug else data_u2
 
             # model2.train() would ALSO flip teacher_model into train mode
             # (nn.Module.train() recurses into every submodule) -- it must
@@ -473,7 +526,8 @@ def main():
                     teacher_feat_u2 = model2.teacher_model.forward_features(data_u2)
                     self_ref_logit_clip = model2.teacher_model.forward_head(teacher_feat_u2).detach()
             clf_loss, transfer_loss, target_logits2 = model2(
-                data_x2, data_u2, label_x2, self_ref_logit_clip=self_ref_logit_clip
+                data_x2, data_u2, label_x2, self_ref_logit_clip=self_ref_logit_clip,
+                own_pred_target_img=(data_u2_strong if args.strong_aug else None),
             )
             loss2_self = clf_loss + transfer_loss
 
@@ -517,8 +571,15 @@ def main():
 
         logits1_x, feat_x1 = student1(image_x1)
         loss_x1 = F.cross_entropy(logits1_x, label_x1)
-        logits1_u, feat_u1 = student1(image_u1)
-        loss_mmd1 = MK_MMD(feat_x1, feat_u1)
+        # MK-MMD stays weak-vs-weak (source has no strong view either) --
+        # comparing it against a strong-augmented target would confound
+        # domain shift with augmentation-strength shift, which isn't what
+        # MK-MMD is meant to measure. Cheap for Student1 (LoRA), so just an
+        # extra forward call rather than reusing logits1_u's own feat.
+        _, feat_u1_weak = student1(image_u1)
+        loss_mmd1 = MK_MMD(feat_x1, feat_u1_weak)
+        # self+cross loss use the STRONG view instead (see --strong-aug).
+        logits1_u, _ = student1(image_u1_strong)
 
         if in_warmup:
             loss_u1_self = _masked_ce(logits1_u, prob_cross_for_s1)
