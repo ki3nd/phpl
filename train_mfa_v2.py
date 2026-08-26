@@ -36,13 +36,22 @@ DataManager. Student 2 / Teacher 2 now:
     has no separate classifier-head EMA at all (only one classifier_layer
     exists) -- this project adds one anyway (teacher_classifier_layer, a
     deepcopy of model2.classifier_layer), so "Teacher2" = EMA-backbone
-    features fed through this separate EMA head, not the live one. Both
-    the backbone's and the head's EMA share the SAME --s2-ema-warmup-iters
-    window (hard-copy together, then switch to their own real momentum
-    together) -- otherwise Teacher2 would be a smoothed backbone paired
-    with an instantaneously-tracking head (or vice versa) during that
-    window, since the head is trained against the LIVE backbone's
-    features, not the lagging EMA one.
+    features fed through this separate EMA head, not the live one. By
+    default BOTH get a DACS-style (Tarvainen & Valpola / vikolss/DACS
+    update_ema_variables) ramp-up momentum every step from s2_it_global=0:
+    momentum_t = min(t / (t+1), --s2-ema-momentum). This degenerates to a
+    hard-copy at t=0 (teacher := student's CURRENT, already-gradient-
+    stepped weights, never the raw random init -- the EMA update runs
+    AFTER optimizer.step()) and ramps smoothly up to the target momentum
+    over ~momentum/(1-momentum) steps (~99 steps for the 0.99 default),
+    with no arbitrary warmup-length hyperparameter and no discontinuous
+    jump. The old hard-copy-for-N-steps-then-jump behavior is still
+    available behind --s2-ema-warmup (off by default) for ablation, using
+    --s2-ema-warmup-iters as the hard-copy window. Either way, the
+    backbone's and the head's EMA share the exact same momentum_t each
+    step -- otherwise Teacher2 would be a smoothed backbone paired with an
+    instantaneously-tracking head (or vice versa), since the head is
+    trained against the LIVE backbone's features, not the lagging EMA one.
   - Data: both branches use dassl's own DataManager (each its own SEPARATE
     instance, own independent shuffled stream -- see train_mfa.py's own
     loader-independence fix), with VLP-UDA's own transform (Resize(256,256)
@@ -232,7 +241,17 @@ def main():
     parser.add_argument("--print-freq", type=int, default=50, help="in macro-steps")
     parser.add_argument("--eval-freq", type=int, default=200, help="in macro-steps")
     parser.add_argument("--hparams-config", type=str, default="configs/mfa/hparams_v2.yaml")
-    parser.add_argument("--warmup-iters", type=int, default=100)
+    parser.add_argument("--s1-warmup-iters", type=int, default=50,
+                         help="macro-steps (Student1's own cadence) before Student1 switches "
+                              "from the frozen zero-shot CLIP self-reference to its own "
+                              "teacher1 EMA + starts pulling the cross term from Teacher2. "
+                              "Separate from --s2-warmup-iters so the two branches' "
+                              "cross-teaching onset can be ablated independently.")
+    parser.add_argument("--s2-warmup-iters", type=int, default=50,
+                         help="s2 micro-steps (s2_it_global, Student2's own cadence -- "
+                              "--s2-per-s1 times denser than macro-steps) before Student2 "
+                              "starts adding the cross term from Teacher1. Separate from "
+                              "--s1-warmup-iters -- see its help text.")
 
     # Student 1 -- identical set of flags to train_mfa.py.
     parser.add_argument("--s1-lr", type=float, default=0.0035)
@@ -269,16 +288,25 @@ def main():
                               "reg_loss's entropy-min term still always uses the LIVE cosine "
                               "branch (unaffected), so it keeps training it regardless.")
     parser.add_argument("--s2-ema-momentum", type=float, default=0.99,
-                         help="ONE shared EMA momentum for BOTH model2.teacher_model "
-                              "(backbone) and teacher_classifier_layer (head), active AFTER "
-                              "--s2-ema-warmup-iters")
+                         help="ONE shared EMA momentum target for BOTH model2.teacher_model "
+                              "(backbone) and teacher_classifier_layer (head). By default this "
+                              "is the ASYMPTOTIC target of a DACS-style ramp-up "
+                              "(min(t/(t+1), momentum), t=s2_it_global) applied every step from "
+                              "t=0 -- see --s2-ema-warmup to use a fixed hard-copy-then-jump "
+                              "schedule instead.")
+    parser.add_argument("--s2-ema-warmup", action="store_true",
+                         help="Use the old hard-copy-for-N-steps-then-jump EMA schedule for "
+                              "Teacher2 (momentum=0 for --s2-ema-warmup-iters steps, then a "
+                              "discontinuous jump to --s2-ema-momentum) instead of the default "
+                              "DACS-style continuous ramp-up. Off by default -- kept for "
+                              "ablation only.")
     parser.add_argument("--s2-ema-warmup-iters", type=int, default=100,
-                         help="BOTH teacher_model and teacher_classifier_layer hard-copy "
-                              "model2.base_network/classifier_layer every step for this many "
-                              "iterations (momentum=0) before switching to --s2-ema-momentum "
-                              "together -- kept in sync so Teacher2 is never a smoothed "
-                              "backbone paired with an instantaneously-tracking head or vice "
-                              "versa")
+                         help="Only used when --s2-ema-warmup is set. BOTH teacher_model and "
+                              "teacher_classifier_layer hard-copy model2.base_network/"
+                              "classifier_layer every step for this many iterations "
+                              "(momentum=0) before switching to --s2-ema-momentum together -- "
+                              "kept in sync so Teacher2 is never a smoothed backbone paired "
+                              "with an instantaneously-tracking head or vice versa")
     parser.add_argument("--s2-batch-size", type=int, default=32)
     parser.add_argument("--s2-num-workers", type=int, default=8)
     parser.add_argument("--strong-aug", action="store_true",
@@ -433,7 +461,7 @@ def main():
         optim2, lr_lambda=lambda step: args.s2_lr * (1.0 + args.s2_lr_gamma * float(step)) ** (-args.s2_lr_decay)
     )
 
-    s1_post_warmup = max(args.s1_total_iters - args.warmup_iters, 1)
+    s1_post_warmup = max(args.s1_total_iters - args.s1_warmup_iters, 1)
     sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(optim1, T_max=s1_post_warmup)
 
     print("Building frozen zero-shot CLIP (Student1's warmup reference only)")
@@ -456,13 +484,17 @@ def main():
 
     s2_it_global = 0
     for macro in range(args.s1_total_iters):
-        in_warmup = macro < args.warmup_iters
+        # Student1's own warmup (macro-step cadence) and Student2's own
+        # warmup (s2_it_global cadence, --s2-per-s1 times denser) are
+        # tracked separately so each branch's cross-teaching onset can be
+        # ablated independently -- they are NOT required to line up.
+        in_warmup1 = macro < args.s1_warmup_iters
 
-        if not in_warmup and teacher_frozen is not None:
-            # teacher_frozen is only ever read inside `if in_warmup:` blocks
-            # -- once warmup ends it's dead weight (a whole extra CLIP model)
-            # sitting on the GPU for the rest of the run. Free it right here
-            # instead of holding it until the process exits.
+        if not in_warmup1 and teacher_frozen is not None:
+            # teacher_frozen is only ever read inside `if in_warmup1:` blocks
+            # -- once Student1's warmup ends it's dead weight (a whole extra
+            # CLIP model) sitting on the GPU for the rest of the run. Free
+            # it right here instead of holding it until the process exits.
             del teacher_frozen, clip_frozen
             teacher_frozen = None
             torch.cuda.empty_cache()
@@ -481,7 +513,7 @@ def main():
         image_u1_strong = batch_u1["img2"].to(device) if args.strong_aug else image_u1
 
         with torch.no_grad():
-            if in_warmup:
+            if in_warmup1:
                 logits_cross_for_s1, _ = teacher_frozen(image_u1)
             else:
                 # "Teacher2" for Student1's cross term: EMA backbone
@@ -493,6 +525,7 @@ def main():
             prob_cross_for_s1 = F.softmax(logits_cross_for_s1, dim=-1)
 
         for _ in range(args.s2_per_s1):
+            in_warmup2 = s2_it_global < args.s2_warmup_iters
             batch_x2 = train_loader_x2.next()
             batch_u2 = train_loader_u2.next()
             data_x2 = batch_x2["img"].to(device)
@@ -531,7 +564,7 @@ def main():
             )
             loss2_self = clf_loss + transfer_loss
 
-            if in_warmup:
+            if in_warmup2:
                 loss2_cross = torch.tensor(0.0, device=device)
                 loss2 = loss2_self
             else:
@@ -555,16 +588,27 @@ def main():
             optim2.step()
             sched2.step()
 
-            # Backbone and head EMA share the SAME warmup window
-            # (--s2-ema-warmup-iters) -- both hard-copy (momentum=0)
-            # together at first, then both switch to their own real
-            # momentum together. Giving the backbone a real momentum from
-            # step 0 while the head hard-copies would leave Teacher2 as a
+            # Backbone and head EMA always share the SAME momentum this
+            # step -- giving the backbone a real momentum while the head
+            # hard-copies (or vice versa) would leave Teacher2 as a
             # smoothed backbone paired with an instantaneously-tracking
-            # head for that whole window -- a mismatch, since the head is
-            # trained (via TransferNet.forward()) against the LIVE
-            # backbone's features, not the lagging EMA one.
-            ema_momentum = 0.0 if s2_it_global < args.s2_ema_warmup_iters else args.s2_ema_momentum
+            # head -- a mismatch, since the head is trained (via
+            # TransferNet.forward()) against the LIVE backbone's features,
+            # not the lagging EMA one.
+            if args.s2_ema_warmup:
+                # Ablation-only: hard-copy (momentum=0) for
+                # --s2-ema-warmup-iters steps, then a discontinuous jump to
+                # --s2-ema-momentum.
+                ema_momentum = 0.0 if s2_it_global < args.s2_ema_warmup_iters else args.s2_ema_momentum
+            else:
+                # Default: DACS-style ramp-up (vikolss/DACS's
+                # update_ema_variables), min(t/(t+1), momentum) every step
+                # from t=0. At t=0 this is 0/(0+1)=0 -- a hard-copy, but of
+                # the student's CURRENT (post-optimizer.step()) weights,
+                # never the raw random init -- then ramps continuously up
+                # to --s2-ema-momentum over ~momentum/(1-momentum) steps
+                # instead of jumping there after a fixed warmup window.
+                ema_momentum = min(s2_it_global / (s2_it_global + 1), args.s2_ema_momentum)
             ema_update_teacher(model2.teacher_model, model2.base_network, ema_momentum)
             ema_update_teacher(teacher_classifier_layer, model2.classifier_layer, ema_momentum)
             s2_it_global += 1
@@ -581,7 +625,7 @@ def main():
         # self+cross loss use the STRONG view instead (see --strong-aug).
         logits1_u, _ = student1(image_u1_strong)
 
-        if in_warmup:
+        if in_warmup1:
             loss_u1_self = _masked_ce(logits1_u, prob_cross_for_s1)
             loss_u1_cross = torch.tensor(0.0, device=device)
             loss1 = loss_x1 + loss_u1_self + args.s1_mmd_weight * loss_mmd1
@@ -596,7 +640,7 @@ def main():
                 + args.s1_mmd_weight * loss_mmd1
             )
 
-        if in_warmup:
+        if in_warmup1:
             for pg in optim1.param_groups:
                 pg["lr"] = args.s1_warmup_lr
 
@@ -606,7 +650,7 @@ def main():
             [p for p in student1.parameters() if p.requires_grad], max_norm=20.0
         )
         optim1.step()
-        if not in_warmup:
+        if not in_warmup1:
             sched1.step()
 
         _ema_update_lora_params(teacher1, student1, lambda k: args.s1_ema_momentum)
@@ -623,10 +667,28 @@ def main():
                 f"cross {loss2_cross.item():.4f}) acc_x2 {acc_x2:.2f}"
             )
 
-        if (macro + 1) % args.eval_freq == 0 or (macro + 1) == args.s1_total_iters or (macro + 1) == args.warmup_iters:
+        # s2_it_global has already been advanced past this macro-step's
+        # s2_per_s1 micro-iterations by here, so ">= s2_warmup_iters" (not
+        # "==") catches the macro-step Student2's own warmup ends in, even
+        # though it isn't tied 1:1 to macro-steps like Student1's is.
+        s2_warmup_just_ended = (
+            s2_it_global >= args.s2_warmup_iters
+            and s2_it_global - args.s2_per_s1 < args.s2_warmup_iters
+        )
+        if (
+            (macro + 1) % args.eval_freq == 0
+            or (macro + 1) == args.s1_total_iters
+            or (macro + 1) == args.s1_warmup_iters
+            or s2_warmup_just_ended
+        ):
             model2.eval()
             acc1, acc2, acc_ens = evaluate(teacher1, model2, teacher_classifier_layer, test_loader, device)
-            tag = " [end of warmup]" if (macro + 1) == args.warmup_iters else ""
+            tags = []
+            if (macro + 1) == args.s1_warmup_iters:
+                tags.append("end of s1 warmup")
+            if s2_warmup_just_ended:
+                tags.append("end of s2 warmup")
+            tag = f" [{', '.join(tags)}]" if tags else ""
             print(f"[eval] macro {macro + 1}{tag}: Teacher1 {acc1:.2f}% | Teacher2 {acc2:.2f}% | Ensemble {acc_ens:.2f}%")
 
             save_lora(cfg, lora1_t, osp.join(args.output_dir, "Teacher1"), filename="LoRA-last")
