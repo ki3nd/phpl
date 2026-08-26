@@ -8,6 +8,10 @@ s1:
   lr: 0.0035
   momentum: 0.9
   weight_decay: 5.0e-4
+  # MK-MMD is ON by default. Set to 0.0 to turn it off entirely -- that skips
+  # the MK_MMD call AND the target-side forward pass that only exists to feed
+  # it. This value OVERRIDES --s1-mmd-weight's own argparse default, so the
+  # two are deliberately kept in sync at 1.0.
   mmd_weight: 1.0
   warmup_lr: 0.001
   cross_weight: 0.5

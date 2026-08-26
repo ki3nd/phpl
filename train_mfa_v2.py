@@ -261,7 +261,15 @@ def main():
     parser.add_argument("--s1-lr", type=float, default=0.0035)
     parser.add_argument("--s1-momentum", type=float, default=0.9)
     parser.add_argument("--s1-weight-decay", type=float, default=5e-4)
-    parser.add_argument("--s1-mmd-weight", type=float, default=1.0)
+    parser.add_argument("--s1-mmd-weight", type=float, default=1.0,
+                         help="Weight on Student1's MK-MMD source/target feature-alignment "
+                              "loss (default 1.0, i.e. ON). Pass 0.0 to turn it OFF ENTIRELY: "
+                              "both the MK_MMD call and the target-side forward pass that "
+                              "exists only to feed it are skipped, so it then costs nothing. "
+                              "NOTE: configs/mfa/hparams_v2.yaml's s1.mmd_weight overrides "
+                              "this argparse default (see _load_hparams_as_defaults), so both "
+                              "are kept at 1.0 -- change either one and the other no longer "
+                              "governs.")
     parser.add_argument("--s1-warmup-lr", type=float, default=0.001)
     parser.add_argument("--s1-cross-weight", type=float, default=0.5)
     parser.add_argument("--s1-ema-momentum", type=float, default=0.996)
@@ -713,13 +721,20 @@ def main():
 
         logits1_x, feat_x1 = student1(image_x1)
         loss_x1 = F.cross_entropy(logits1_x, label_x1)
-        # MK-MMD stays weak-vs-weak (source has no strong view either) --
-        # comparing it against a strong-augmented target would confound
-        # domain shift with augmentation-strength shift, which isn't what
-        # MK-MMD is meant to measure. Cheap for Student1 (LoRA), so just an
-        # extra forward call rather than reusing logits1_u's own feat.
-        _, feat_u1_weak = student1(image_u1)
-        loss_mmd1 = MK_MMD(feat_x1, feat_u1_weak)
+        # ON by default (--s1-mmd-weight 1.0); passing 0.0 skips the WHOLE
+        # thing, including the target-side forward pass that exists only to
+        # feed MK-MMD, not just the multiply (same gating as MMD_WEIGHT in
+        # trainers/da/phpl_momentum.py). MK-MMD stays weak-vs-weak (source has
+        # no strong view either) -- comparing it against a strong-augmented
+        # target would confound domain shift with augmentation-strength shift,
+        # which isn't what MK-MMD is meant to measure. Cheap for Student1
+        # (LoRA), so just an extra forward call rather than reusing logits1_u's
+        # own feat.
+        if args.s1_mmd_weight > 0:
+            _, feat_u1_weak = student1(image_u1)
+            loss_mmd1 = MK_MMD(feat_x1, feat_u1_weak)
+        else:
+            loss_mmd1 = torch.tensor(0.0, device=device)
         # self+cross loss use the STRONG view instead (see --strong-aug).
         logits1_u, _ = student1(image_u1_strong)
 
