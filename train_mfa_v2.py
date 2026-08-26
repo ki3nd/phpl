@@ -332,6 +332,34 @@ def main():
                               "own forward call uses, for free. evaluate() is entirely "
                               "unaffected (test_loader keeps its own separate, deterministic "
                               "transform, never touched by this flag).")
+    parser.add_argument("--s1-threshold", type=float, default=None,
+                         help="ONE shared confidence threshold for the pseudo-label mask on "
+                              "EVERY reference distribution, both branches (Student1's warmup "
+                              "self-reference from teacher_frozen, its post-warmup "
+                              "self-reference from teacher1, its cross-reference from "
+                              "teacher_classifier_layer, and Student2's cross-reference from "
+                              "teacher1) -- exactly the same single cutoff the code already "
+                              "used, just settable now. Defaults to "
+                              "cfg.TRAINER.PHPLMOMENTUM.CONFI (0.85), i.e. unchanged behavior.")
+    parser.add_argument("--s1-loss-u-mode", choices=["mask", "ratio"], default="mask",
+                         help="How Student1's SELF loss (loss_u1_self -- reference is "
+                              "teacher_frozen during warmup, teacher1 after) reduces its "
+                              "per-sample CE. 'mask' (default, PHPL's own): average CE over "
+                              "ONLY the samples clearing --s1-threshold, i.e. divide by the "
+                              "COUNT that pass -- loss magnitude is independent of how few "
+                              "pass, so it gets high-variance when that count is small. "
+                              "'ratio' (DACS-style, cf. LOSS_U_MODE in phpl_momentum.py): CE "
+                              "over ALL samples (argmax pseudo-label for every one, confident "
+                              "or not), scaled by the FRACTION that pass -- smooth curriculum, "
+                              "lower gradient variance, but the term shrinks proportionally "
+                              "when few pass. Both are exactly 0 when nothing passes.")
+    parser.add_argument("--s1-loss-cross-mode", choices=["mask", "ratio"], default="mask",
+                         help="Same choice, for Student1's CROSS loss (loss_u1_cross -- "
+                              "reference is teacher_classifier_layer, branch 2's learned, "
+                              "label-smoothed head). Separate from --s1-loss-u-mode because "
+                              "this reference is far softer than branch 1's "
+                              "logit_scale(~100)-saturated cosine outputs, so the two losses "
+                              "sit in very different mask-sparsity regimes.")
     parser.add_argument("--use-debias", action="store_true",
                          help="Logit-adjustment debiasing (UniMoS/DebiasPL-style, same "
                               "mechanism as cfg.TRAINER.PHPLMOMENTUM.USE_DEBIAS in train.py) "
@@ -495,12 +523,26 @@ def main():
         param.requires_grad_(False)
     teacher_frozen.eval()
 
-    confi = cfg.TRAINER.PHPLMOMENTUM.CONFI
+    # ONE shared threshold for every reference distribution on both branches
+    # (see --s1-threshold) -- same single cutoff the code already used, just
+    # settable. Defaults to cfg.TRAINER.PHPLMOMENTUM.CONFI, so passing nothing
+    # preserves the old behavior exactly.
+    confi = args.s1_threshold if args.s1_threshold is not None else cfg.TRAINER.PHPLMOMENTUM.CONFI
+    print(f"Pseudo-label threshold (shared, both branches): {confi} "
+          f"(cfg.TRAINER.PHPLMOMENTUM.CONFI={cfg.TRAINER.PHPLMOMENTUM.CONFI})")
     best_acc1, best_acc2, best_acc_ens = 0.0, 0.0, 0.0
 
-    def _masked_ce(logits, prob_ref):
+    def _pseudo_label_loss(logits, prob_ref, mode="mask"):
+        """mode "mask" (default) is the original behavior, unchanged; "ratio"
+        is phpl_momentum.py's own LOSS_U_MODE "ratio" (DACS-style). See
+        --s1-loss-u-mode's help text for the difference."""
         max_probs, pseudo_label = torch.max(prob_ref, dim=-1)
         mask = max_probs.ge(confi).float()
+        if mode == "ratio":
+            # No sample dropped -- CE over the WHOLE batch (argmax
+            # pseudo-label for every sample), scaled by the fraction that
+            # clears `confi`.
+            return F.cross_entropy(logits, pseudo_label) * mask.mean()
         epsilon = 1e-8
         return (F.cross_entropy(logits, pseudo_label, reduction="none") * mask).sum() / (mask.sum() + epsilon)
 
@@ -634,7 +676,9 @@ def main():
                     if args.use_debias:
                         logits_t1_u2 = _debias_correct(logits_t1_u2, qhat1)
                     prob_cross2 = F.softmax(logits_t1_u2, dim=-1)
-                loss2_cross = _masked_ce(target_logits2, prob_cross2)
+                # Branch 2's own cross loss keeps the original "mask"
+                # reduction -- --s1-loss-*-mode only govern branch 1.
+                loss2_cross = _pseudo_label_loss(target_logits2, prob_cross2)
                 loss2 = loss2_self + args.s2_cross_weight * loss2_cross
 
             optim2.zero_grad()
@@ -680,7 +724,7 @@ def main():
         logits1_u, _ = student1(image_u1_strong)
 
         if in_warmup1:
-            loss_u1_self = _masked_ce(logits1_u, prob_cross_for_s1)
+            loss_u1_self = _pseudo_label_loss(logits1_u, prob_cross_for_s1, args.s1_loss_u_mode)
             loss_u1_cross = torch.tensor(0.0, device=device)
             loss1 = loss_x1 + loss_u1_self + args.s1_mmd_weight * loss_mmd1
         else:
@@ -689,8 +733,8 @@ def main():
                 if args.use_debias:
                     logits_t1_self = _debias_correct(logits_t1_self, qhat1)
                 prob_self1 = F.softmax(logits_t1_self, dim=-1)
-            loss_u1_self = _masked_ce(logits1_u, prob_self1)
-            loss_u1_cross = _masked_ce(logits1_u, prob_cross_for_s1)
+            loss_u1_self = _pseudo_label_loss(logits1_u, prob_self1, args.s1_loss_u_mode)
+            loss_u1_cross = _pseudo_label_loss(logits1_u, prob_cross_for_s1, args.s1_loss_cross_mode)
             loss1 = (
                 loss_x1 + loss_u1_self + args.s1_cross_weight * loss_u1_cross
                 + args.s1_mmd_weight * loss_mmd1
