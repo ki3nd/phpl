@@ -247,11 +247,15 @@ def main():
                               "teacher1 EMA + starts pulling the cross term from Teacher2. "
                               "Separate from --s2-warmup-iters so the two branches' "
                               "cross-teaching onset can be ablated independently.")
-    parser.add_argument("--s2-warmup-iters", type=int, default=50,
+    parser.add_argument("--s2-warmup-iters", type=int, default=500,
                          help="s2 micro-steps (s2_it_global, Student2's own cadence -- "
                               "--s2-per-s1 times denser than macro-steps) before Student2 "
-                              "starts adding the cross term from Teacher1. Separate from "
-                              "--s1-warmup-iters -- see its help text.")
+                              "starts adding the cross term from Teacher1. Default (500) is "
+                              "--s1-warmup-iters's default (50) times the default --s2-per-s1 "
+                              "(10), so both branches end their warmup at roughly the same "
+                              "macro-step by default -- separate from --s1-warmup-iters, so "
+                              "the two can still be set independently to ablate cross-teaching "
+                              "onset per branch.")
 
     # Student 1 -- identical set of flags to train_mfa.py.
     parser.add_argument("--s1-lr", type=float, default=0.0035)
