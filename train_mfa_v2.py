@@ -332,6 +332,24 @@ def main():
                               "own forward call uses, for free. evaluate() is entirely "
                               "unaffected (test_loader keeps its own separate, deterministic "
                               "transform, never touched by this flag).")
+    parser.add_argument("--use-debias", action="store_true",
+                         help="Logit-adjustment debiasing (UniMoS/DebiasPL-style, same "
+                              "mechanism as cfg.TRAINER.PHPLMOMENTUM.USE_DEBIAS in train.py) "
+                              "against CLIP's own zero-shot class bias, applied to the "
+                              "genuine CLIP-cosine teacher predictions on BOTH branches -- NOT "
+                              "to teacher_classifier_layer's output (Teacher2's learned-head "
+                              "cross-reference to Student1, which isn't a CLIP prediction). "
+                              "Two INDEPENDENT EMA trackers (qhat1, qhat2), one per branch: "
+                              "qhat1 covers teacher_frozen (Student1's warmup self-reference) "
+                              "and teacher1 (self-reference post-warmup + cross-reference to "
+                              "Student2); qhat2 covers Teacher2's cosine branch "
+                              "(self_ref_logit_clip) ONLY when --s2-self-from-teacher is set "
+                              "(the only place it's computed outside vlpuda_pure's own "
+                              "forward()).")
+    parser.add_argument("--debias-tau", type=float, default=0.5,
+                         help="Only used when --use-debias is set -- see its help text.")
+    parser.add_argument("--debias-momentum", type=float, default=0.99,
+                         help="Only used when --use-debias is set -- see its help text.")
     parser.add_argument("--disable-s1", action="store_true",
                          help="Train Student2 alone, with NOTHING from dassl (no Student1, "
                               "no shared test_loader) -- to check Student2 in isolation "
@@ -486,6 +504,21 @@ def main():
         epsilon = 1e-8
         return (F.cross_entropy(logits, pseudo_label, reduction="none") * mask).sum() / (mask.sum() + epsilon)
 
+    # --use-debias: see its own help text for scope (teacher1/teacher_frozen
+    # only for qhat1, Teacher2's cosine branch only for qhat2). Matches
+    # cfg.TRAINER.PHPLMOMENTUM.USE_DEBIAS's own update order in
+    # trainers/da/phpl_momentum.py: correct `logits` using qhat as of
+    # BEFORE this call, then update qhat from `logits`' own RAW
+    # (pre-correction) prediction -- never the other way around.
+    def _debias_correct(logits, qhat):
+        prob_raw = F.softmax(logits, dim=-1)
+        corrected = logits - args.debias_tau * torch.log(qhat)
+        qhat.mul_(args.debias_momentum).add_(prob_raw.mean(dim=0), alpha=1.0 - args.debias_momentum)
+        return corrected
+
+    qhat1 = torch.full((num_classes,), 1.0 / num_classes, device=device) if args.use_debias else None
+    qhat2 = torch.full((num_classes,), 1.0 / num_classes, device=device) if args.use_debias else None
+
     s2_it_global = 0
     for macro in range(args.s1_total_iters):
         # Student1's own warmup (macro-step cadence) and Student2's own
@@ -519,6 +552,11 @@ def main():
         with torch.no_grad():
             if in_warmup1:
                 logits_cross_for_s1, _ = teacher_frozen(image_u1)
+                if args.use_debias:
+                    # teacher_frozen IS a genuine CLIP zero-shot prediction
+                    # (same qhat1 tracker teacher1 uses post-warmup, so it
+                    # carries over seamlessly once teacher1 takes over).
+                    logits_cross_for_s1 = _debias_correct(logits_cross_for_s1, qhat1)
             else:
                 # "Teacher2" for Student1's cross term: EMA backbone
                 # (model2.teacher_model) through its own EMA head
@@ -562,6 +600,16 @@ def main():
                 with torch.no_grad():
                     teacher_feat_u2 = model2.teacher_model.forward_features(data_u2)
                     self_ref_logit_clip = model2.teacher_model.forward_head(teacher_feat_u2).detach()
+                    if args.use_debias:
+                        # Teacher2's cosine branch IS a genuine CLIP
+                        # prediction (unlike teacher_classifier_layer) --
+                        # its own qhat2 tracker, separate from qhat1. Only
+                        # reachable here since this is the only place
+                        # Teacher2's cosine branch is computed OUTSIDE
+                        # vlpuda_pure's own (untouched) forward() --
+                        # self-from-student's internal reference isn't
+                        # debiased (out of scope for now).
+                        self_ref_logit_clip = _debias_correct(self_ref_logit_clip, qhat2)
             clf_loss, transfer_loss, target_logits2 = model2(
                 data_x2, data_u2, label_x2, self_ref_logit_clip=self_ref_logit_clip,
                 own_pred_target_img=(data_u2_strong if args.strong_aug else None),
@@ -583,6 +631,8 @@ def main():
                 # concern applies anymore -- target_logits2 is free.
                 with torch.no_grad():
                     logits_t1_u2, _ = teacher1(data_u2)
+                    if args.use_debias:
+                        logits_t1_u2 = _debias_correct(logits_t1_u2, qhat1)
                     prob_cross2 = F.softmax(logits_t1_u2, dim=-1)
                 loss2_cross = _masked_ce(target_logits2, prob_cross2)
                 loss2 = loss2_self + args.s2_cross_weight * loss2_cross
@@ -636,6 +686,8 @@ def main():
         else:
             with torch.no_grad():
                 logits_t1_self, _ = teacher1(image_u1)
+                if args.use_debias:
+                    logits_t1_self = _debias_correct(logits_t1_self, qhat1)
                 prob_self1 = F.softmax(logits_t1_self, dim=-1)
             loss_u1_self = _masked_ce(logits1_u, prob_self1)
             loss_u1_cross = _masked_ce(logits1_u, prob_cross_for_s1)
