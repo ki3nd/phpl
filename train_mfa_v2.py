@@ -367,7 +367,22 @@ def main():
     parser.add_argument("--s2-cross-weight", type=float, default=0.5,
                          help="weight on Student 2's cross-teaching loss term "
                               "(NOT part of CMKD -- added on top, same as train_mfa.py)")
-    parser.add_argument("--s2-cross-mode", choices=["mask", "gini"], default="mask")
+    parser.add_argument("--s2-cross-mode", choices=["mask", "gini"], default="mask",
+                         help="Form of Student2's cross loss (Teacher1 -> Student2). 'mask' "
+                              "(default): CONFI hard-threshold + CE on the argmax pseudo-label, "
+                              "at a CONSTANT --s2-cross-weight. 'gini': CMKD's own task/distill "
+                              "pair (model2.cmkd's own gini_impurity/calibrated_coefficient, so "
+                              "the arithmetic is identical to the self loss) with Teacher1 as "
+                              "the reference -- no argmax, no threshold, every target sample "
+                              "contributes weighted by coe=exp(-KL), and the term is scaled by "
+                              "lambda1 * lamb so it ramps on the SAME schedule as the self loss "
+                              "instead of being diluted by it. Measured on this run's logits at "
+                              "batch 32, the two modes are the same order of magnitude but "
+                              "follow different curves -- gini goes 0.05 -> 0.93 as lamb ramps "
+                              "0.025 -> 0.462, while mask sits flat near 0.08 -- so a single "
+                              "--s2-cross-weight does not mean the same thing in both; sweep it "
+                              "per mode. --s1-threshold has no effect on this loss in 'gini' "
+                              "mode.")
     parser.add_argument("--s2-self-from-teacher", action="store_true",
                          help="Self-loss's reference (coe/mix in CMKD's task_loss/distill_loss) "
                               "comes from Teacher2's EMA cosine branch (model2.teacher_model, "
@@ -786,6 +801,12 @@ def main():
                         # self-from-student's internal reference isn't
                         # debiased (out of scope for now).
                         self_ref_logit_clip = _debias_correct(self_ref_logit_clip, qhat2)
+            # Read the CMKD ramp BEFORE the forward: cmkd.py's forward reads
+            # lamb at its top and calls self.lamb.step() at its bottom, so
+            # reading it afterwards would give the NEXT step's value, not the
+            # one the self-loss just used. --s2-cross-mode gini wants the same
+            # lamb the self term got.
+            lamb_cross = model2.cmkd.lamb.lamb()
             clf_loss, transfer_loss, target_logits2 = model2(
                 data_x2, data_u2, label_x2, self_ref_logit_clip=self_ref_logit_clip,
                 own_pred_target_img=(data_u2_strong if args.strong_aug else None),
@@ -810,9 +831,34 @@ def main():
                     if args.use_debias:
                         logits_t1_u2 = _debias_correct(logits_t1_u2, qhat1)
                     prob_cross2 = F.softmax(logits_t1_u2, dim=-1)
-                # Branch 2's own cross loss keeps the original "mask"
-                # reduction -- --s1-loss-*-mode only govern branch 1.
-                loss2_cross = _pseudo_label_loss(target_logits2, prob_cross2)
+                if args.s2_cross_mode == "gini":
+                    # CMKD's own task/distill pair, but with Teacher1 as the
+                    # reference instead of Student2's own cosine branch.
+                    # Calls model2.cmkd's OWN methods rather than a copy, so
+                    # this is byte-identical arithmetic to the self term
+                    # (train_cmkd.py's hand-ported _gini_impurity /
+                    # _calibrated_coefficient differ slightly -- an extra
+                    # clamp and epsilon -- and using those here would put a
+                    # second variable into the mask-vs-gini comparison).
+                    # lambda1 * lamb is applied here, so unlike "mask" this
+                    # term ramps with the same schedule as the self loss
+                    # instead of staying at a constant weight. No confidence
+                    # threshold either: every target sample contributes,
+                    # weighted by coe = exp(-KL(teacher || student)).
+                    pred_own = F.softmax(target_logits2, dim=1)
+                    pred_ref = prob_cross2.detach()
+                    coe = model2.cmkd.calibrated_coefficient(pred_own, pred_ref)
+                    pred_mix = 0.5 * (pred_own + pred_ref)
+                    loss2_cross = (
+                        args.s2_lambda1 * lamb_cross * model2.cmkd.gini_impurity(pred_own, coe)
+                        + args.s2_lambda1 * lamb_cross * model2.cmkd.gini_impurity(pred_mix, 1 - coe)
+                    )
+                else:
+                    # PHPL-style CONFI hard-threshold mask + CE. Note this
+                    # branch is NOT ramped -- it sits at a constant
+                    # --s2-cross-weight while the self loss ramps up, so its
+                    # relative share shrinks over training.
+                    loss2_cross = _pseudo_label_loss(target_logits2, prob_cross2)
                 loss2 = loss2_self + args.s2_cross_weight * loss2_cross
 
             optim2.zero_grad()
