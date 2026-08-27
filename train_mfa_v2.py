@@ -277,6 +277,20 @@ def main():
     # Student 2 -- now TransferNet/CMKD's own real hyperparameters (see
     # configs/mfa/hparams_v2.yaml for VLP-UDA's actual office_home.yaml
     # values, loaded as defaults below).
+    parser.add_argument("--s2-model-name", choices=["VIT-B", "RN50", "RN101"], default="VIT-B",
+                         help="Branch 2's CLIP backbone (vlpuda_pure/models/backbone.py picks "
+                              "the checkpoint and the feature width from this). Branch 1 is "
+                              "always the --backbone CLIP+LoRA, so setting this to RN50/RN101 "
+                              "makes the two branches ARCHITECTURALLY heterogeneous -- a CNN's "
+                              "local receptive fields against ViT's global attention -- which "
+                              "is the point: two branches sharing one architecture inherit one "
+                              "error set and have little left to teach each other. RN101 keeps "
+                              "output_num=512, the same width as VIT-B, so classifier_layer is "
+                              "unchanged; RN50 is 1024 and resizes it. NOTE: --s2-lr's default "
+                              "(3e-6) is VLP-UDA's tuned value for full ViT fine-tuning and is "
+                              "almost certainly far too small for a ResNet -- expect to sweep "
+                              "it. Also note TransferNet.forward()'s fix_bn, a no-op on ViT, "
+                              "starts actually freezing BatchNorm once this is a ResNet.")
     parser.add_argument("--s2-lr", type=float, default=3e-6, help="vision-encoder LR")
     parser.add_argument("--s2-multiple-lr-classifier", type=float, default=1000)
     parser.add_argument("--s2-lr-gamma", type=float, default=0.0003)
@@ -476,7 +490,7 @@ def main():
     s2_total_iters = args.s1_total_iters * args.s2_per_s1
     vlpuda_args = argparse.Namespace(
         datasets="office_home",
-        model_name="VIT-B",
+        model_name=args.s2_model_name,
         num_class=num_classes,
         baseline=False,
         pda=False,
