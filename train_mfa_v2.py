@@ -129,18 +129,81 @@ def _import_vlpuda_pure():
     try:
         make_model = importlib.import_module("models.make_model")
         tools = importlib.import_module("utils.tools")
+        # backbone too, only for its `clip` module -- re-tokenizing Student 2's
+        # class prompts (see --clarify-classnames) has to use the SAME clip
+        # fork that built them, not this project's own top-level `clip`.
+        backbone = importlib.import_module("models.backbone")
     finally:
         sys.path[:] = saved_path
         for k in [k for k in sys.modules if _matches(k)]:
             del sys.modules[k]
         sys.modules.update(saved_modules)
 
-    return make_model, tools
+    return make_model, tools, backbone
 
 
-_vlpuda_make_model, _vlpuda_tools = _import_vlpuda_pure()
+_vlpuda_make_model, _vlpuda_tools, _vlpuda_backbone = _import_vlpuda_pure()
 TransferNet = _vlpuda_make_model.TransferNet
 ema_update_teacher = _vlpuda_tools.ema_update_teacher
+
+# --clarify-classnames: OfficeHome class names that are ambiguous as BARE
+# WORDS, so CLIP's text embedding lands on the wrong sense. Chosen purely from
+# what each name denotes in the dataset (visible in the LABELED source domain)
+# and from the word's other English senses -- never from target-domain
+# accuracy, which would need target labels this setting does not have. Classes
+# whose bare name is already unambiguous are deliberately left alone: renaming
+# something that already works can only cost. Keys are dassl's own classnames
+# (lowercased directory names, underscores already turned into spaces).
+_CLASSNAME_CLARIFY = {
+    "mouse": "computer mouse",            # vs. the animal
+    "monitor": "computer monitor",        # vs. a person who monitors
+    "computer": "desktop computer",       # bare "computer" is a category, not an object
+    "tv": "television",                   # abbreviation
+    "notebook": "paper notebook",         # vs. a laptop
+    "keyboard": "computer keyboard",      # vs. a musical keyboard
+    "glasses": "eyeglasses",              # vs. drinking glasses
+    "speaker": "loudspeaker",             # vs. a person speaking
+    "fan": "electric fan",                # vs. a sports fan
+    "marker": "marker pen",               # vs. a landmark or a mark
+    "soda": "soda can",                   # vs. baking soda / soda water
+    "pan": "frying pan",                  # vs. the verb / the proper noun
+    "drill": "power drill",               # vs. a drill exercise
+    "ruler": "measuring ruler",           # vs. a monarch
+    "sink": "kitchen sink",               # vs. the verb
+    "folder": "file folder",              # vs. a filesystem folder
+    "postit notes": "post-it notes",      # dataset spells it without the hyphen
+    "flipflops": "flip-flops",            # dataset spells it as one word
+    "clipboards": "clipboard",            # odd plural; also vs. the OS clipboard
+    "lamp shade": "lampshade",            # standard spelling
+    "file cabinet": "filing cabinet",     # standard usage
+}
+
+
+def _clarify_classnames(classnames, enabled):
+    """Map dassl classnames through _CLASSNAME_CLARIFY.
+
+    Disabled: returns the list completely untouched (underscores and all), so
+    every existing call path behaves exactly as before.
+
+    Enabled: returns names with underscores turned into spaces AND the
+    ambiguous ones replaced. The underscore normalization matters -- dassl's
+    classnames come straight from directory names ("alarm_clock"), and while
+    branch 1 strips underscores itself (Base_CustomCLIP does
+    `c.replace("_", " ")`), branch 2's prompts are built from this list
+    directly, so a name left as "alarm_clock" would reach CLIP verbatim."""
+    if not enabled:
+        return list(classnames)
+    out, changed = [], []
+    for c in classnames:
+        plain = c.replace("_", " ").lower()
+        new = _CLASSNAME_CLARIFY.get(plain, plain)
+        if new != plain:
+            changed.append(f"{plain} -> {new}")
+        out.append(new)
+    print(f"--clarify-classnames: rewrote {len(changed)}/{len(classnames)} class names")
+    for line in changed:
+        print(f"    {line}")
+    return out
 
 
 def _load_hparams_as_defaults(parser, path):
@@ -354,6 +417,20 @@ def main():
                               "own forward call uses, for free. evaluate() is entirely "
                               "unaffected (test_loader keeps its own separate, deterministic "
                               "transform, never touched by this flag).")
+    parser.add_argument("--clarify-classnames", action="store_true",
+                         help="Replace ambiguous OfficeHome class names with unambiguous ones "
+                              "in BOTH branches (see _CLASSNAME_CLARIFY): 'mouse' -> 'computer "
+                              "mouse', 'monitor' -> 'computer monitor', 'notebook' -> 'paper "
+                              "notebook', etc. CLIP scores images against the class NAME, so a "
+                              "name whose dominant English sense is the wrong object (the animal "
+                              "mouse, a person who monitors, a laptop) puts the text embedding "
+                              "in the wrong place and both branches inherit that error. Each "
+                              "branch keeps its OWN prompt template (branch 1: utils/templates."
+                              "py's 'a photo of a {}.'; branch 2: vlpuda_pure's 'an image of a "
+                              "{}') -- only the class name inside it changes. The rewrites are "
+                              "justified by what the name denotes in the LABELED source domain "
+                              "plus the word's other senses, never by target-domain accuracy "
+                              "(that would need target labels). Off by default.")
     parser.add_argument("--s1-threshold", type=float, default=None,
                          help="ONE shared confidence threshold for the pseudo-label mask on "
                               "EVERY reference distribution, both branches (Student1's warmup "
@@ -469,7 +546,7 @@ def main():
     train_loader_x1 = CyclingLoader(dm1.train_loader_x)
     train_loader_u1 = CyclingLoader(dm1.train_loader_u)
     test_loader = dm1.test_loader
-    classnames = dm1.dataset.classnames
+    classnames = _clarify_classnames(dm1.dataset.classnames, args.clarify_classnames)
     num_classes = dm1.num_classes
     is_vit = cfg.MODEL.BACKBONE.NAME.split('-')[0] == 'ViT'
 
@@ -506,6 +583,41 @@ def main():
 
     print("Building Student2/Teacher2 (vlpuda_pure's own TransferNet)")
     model2 = TransferNet(vlpuda_args, train=True).to(device)
+    if args.clarify_classnames:
+        # vlpuda_pure/models/backbone.py hardcodes its own class_list with no
+        # hook to override, so retokenize AFTER construction instead of
+        # editing that file. `text`/`text_features` are plain tensor
+        # attributes (not buffers/parameters), so they never appear in
+        # state_dict -- overwriting them here is both safe and permanent, and
+        # loading a checkpoint later cannot silently restore the old ones.
+        # BOTH base_network and teacher_model need it: TransferNet.__init__
+        # deepcopies the former into the latter, so each holds its own copy.
+        # The template is vlpuda's own ("an image of a {}"), only the class
+        # name inside it changes. Its text tower is frozen (get_parameters
+        # optimizes only model.visual + classifier_layer) so these embeddings
+        # stay valid for the whole run.
+        # Guard: this rewrite assumes dassl's class ORDER (sorted directory
+        # names) is the same order as backbone.py's hardcoded office_home
+        # class_list -- verified true for OfficeHome's 65 classes. On any
+        # other dataset the two orders could differ and silently scramble
+        # every text embedding, which would look like a bad result rather
+        # than a bug, so refuse instead of guessing.
+        if cfg.DATASET.NAME != "OfficeHome" or len(classnames) != 65:
+            raise SystemExit(
+                f"--clarify-classnames is only verified for OfficeHome's 65 classes "
+                f"(got {cfg.DATASET.NAME} with {len(classnames)}): _CLASSNAME_CLARIFY's "
+                f"entries and the dassl/vlpuda class-order match are both "
+                f"OfficeHome-specific."
+            )
+        prompts2 = [f"an image of a {c}" for c in classnames]
+        tokens2 = _vlpuda_backbone.clip.tokenize(prompts2).to(device)
+        for net in (model2.base_network, model2.teacher_model):
+            net.text = tokens2
+            with torch.no_grad():
+                tf = net.encode_text().detach()
+            net.text_features = tf / tf.norm(dim=1, keepdim=True)
+        print(f"--clarify-classnames: retokenized Student2's {len(prompts2)} prompts, e.g. "
+              + ", ".join(repr(p) for p in prompts2[:2]))
     # vlpuda_pure's own design has no classifier-head EMA at all (only
     # base_network gets a teacher_model copy) -- the classifier head needs
     # its own teacher too, same as train_mfa.py's teacher2_head, since it's
